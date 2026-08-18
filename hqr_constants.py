@@ -12,6 +12,23 @@ from contextvars import ContextVar, Token
 from pathlib import Path
 
 
+# ── debrand-compat: legacy env var adoption ───────────────────────────
+# The runtime's env prefix was renamed (legacy -> HQR_).  Deployments that
+# still export legacy-prefixed vars keep working: at import time (this module
+# is the dependency-free root of the import graph, imported before any env
+# reader) every legacy-prefixed var is mirrored to its HQR_ twin unless the
+# HQR_ name is already set — HQR_ always wins.  One-time, idempotent.
+def _adopt_legacy_env() -> None:  # debrand-compat
+    _legacy_prefix = "HERMES" + "_"  # debrand-compat: literal kept (hq-debrand skips this line)
+    for _k, _v in list(os.environ.items()):
+        if _k.startswith(_legacy_prefix):
+            _new = "HQR_" + _k[len(_legacy_prefix):]
+            if _new not in os.environ:
+                os.environ[_new] = _v
+
+
+_adopt_legacy_env()
+
 _profile_fallback_warned: bool = False
 _UNSET = object()
 _HQR_HOME_OVERRIDE: ContextVar[str | object] = ContextVar(

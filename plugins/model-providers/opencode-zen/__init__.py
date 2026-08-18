@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from hermes_cli import __version__ as _HERMES_VERSION
+from hqr_cli import __version__ as _HQR_VERSION
 from providers import register_provider
 from providers.base import ProviderProfile
 
@@ -19,11 +19,11 @@ from providers.base import ProviderProfile
 # to OpenRouter, Vercel AI Gateway, and Fireworks. Going through
 # profile.default_headers means they survive model switches and credential
 # rotation. Without them OpenCode only sees the OpenAI SDK's generic
-# "OpenAI/Python x.y.z" User-Agent and can't tell the traffic is Hermes Agent.
+# "OpenAI/Python x.y.z" User-Agent and can't tell the traffic is HQ Runtime Agent.
 _ATTRIBUTION_HEADERS = {
     "HTTP-Referer": "https://hermes-agent.nousresearch.com",
-    "X-Title": "Hermes Agent",
-    "User-Agent": f"HermesAgent/{_HERMES_VERSION}",
+    "X-Title": "HQ Runtime Agent",
+    "User-Agent": f"HqrAgent/{_HQR_VERSION}",
 }
 
 
@@ -76,7 +76,7 @@ class OpenCodeGoProfile(ProviderProfile):
         if _is_glm_5_2_model(model):
             # GLM-5.2 on OpenCode Go uses its native OpenAI-compatible
             # reasoning_effort knob, which has exactly two enabled levels:
-            # high and max. Map Hermes' richer scale onto those; leave the
+            # high and max. Map HQ Runtime' richer scale onto those; leave the
             # server default alone when reasoning is disabled or unset.
             if not isinstance(reasoning_config, dict):
                 return extra_body, top_level

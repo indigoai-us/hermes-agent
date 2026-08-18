@@ -54,7 +54,7 @@ class TestMarkTurnParenting:
         with patch.object(
             plugin_mod.relay_runtime, "active_turn", return_value=live_turn
         ):
-            runtime.mark("hermes.approval.response", {"choice": "once"})
+            runtime.mark("hqr.approval.response", {"choice": "once"})
 
         assert _mark_handle(runtime) == "TURN_HANDLE", (
             "an approval decided mid-conversation must export at turn end, "
@@ -67,7 +67,7 @@ class TestMarkTurnParenting:
         with patch.object(
             plugin_mod.relay_runtime, "active_turn", return_value=None
         ):
-            runtime.mark("hermes.session.end", {})
+            runtime.mark("hqr.session.end", {})
 
         assert _mark_handle(runtime) == "SESSION_HANDLE", (
             "session-level marks with no live turn keep session parentage"
@@ -80,7 +80,7 @@ class TestMarkTurnParenting:
         with patch.object(
             plugin_mod.relay_runtime, "active_turn", return_value=handleless_turn
         ):
-            runtime.mark("hermes.turn.start", {})
+            runtime.mark("hqr.turn.start", {})
 
         assert _mark_handle(runtime) == "SESSION_HANDLE", (
             "a turn whose scope push failed must not strand the mark"
@@ -93,6 +93,6 @@ class TestMarkTurnParenting:
         with patch.object(
             plugin_mod.relay_runtime, "active_turn", return_value=None
         ) as active_turn:
-            runtime.mark("hermes.approval.request", {})
+            runtime.mark("hqr.approval.request", {})
 
         active_turn.assert_called_once_with("sess-long-lived")

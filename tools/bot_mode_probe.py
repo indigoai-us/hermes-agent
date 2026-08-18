@@ -1,7 +1,7 @@
 """Bot Mode roster probe — canonical Bot Chat system prompt section.
 
 When the desktop's Bot Mode manages this install (any profile carries a
-``ui_meta['hermes-bots']`` block in its profile.yaml), a bot's canonical
+``ui_meta['hqr-bots']`` block in its profile.yaml), a bot's canonical
 "Bot Chat" session — and ONLY that session — gets a short "Messaging other
 agents" section so the bot can receive teammate DMs, reply with attribution,
 and hand off @mentions.  Regular sessions never carry the section; the
@@ -44,8 +44,8 @@ _lock = threading.Lock()
 _cached: dict[str, str] = {}
 
 
-def _hermes_root(home: Path) -> Path:
-    """Root ~/.hermes for both the default profile and named profiles."""
+def _hqr_root(home: Path) -> Path:
+    """Root ~/.hqr for both the default profile and named profiles."""
     if home.parent.name == "profiles":
         return home.parent.parent
     return home
@@ -58,7 +58,7 @@ def _profile_name(home: Path) -> str:
 
 
 def _is_bot_managed(profile_dir: Path) -> bool:
-    """True when profile.yaml carries a ui_meta['hermes-bots'] block.
+    """True when profile.yaml carries a ui_meta['hqr-bots'] block.
 
     Cheap substring check before the YAML parse keeps the silent path fast.
     """
@@ -67,13 +67,13 @@ def _is_bot_managed(profile_dir: Path) -> bool:
         if not meta.is_file():
             return False
         raw = meta.read_text(encoding="utf-8", errors="replace")
-        if "hermes-bots" not in raw:
+        if "hqr-bots" not in raw:
             return False
         import yaml
 
         data = yaml.safe_load(raw)
         ui_meta = data.get("ui_meta") if isinstance(data, dict) else None
-        return isinstance(ui_meta, dict) and isinstance(ui_meta.get("hermes-bots"), dict)
+        return isinstance(ui_meta, dict) and isinstance(ui_meta.get("hqr-bots"), dict)
     except Exception:
         return False
 
@@ -101,12 +101,12 @@ def _soul_has_protocol(profile_dir: Path) -> bool:
 
 
 def _handle(name: str) -> str:
-    # The mention middleware aliases the default profile as @hermes.
-    return "hermes" if name == "default" else name
+    # The mention middleware aliases the default profile as @hqr.
+    return "hqr" if name == "default" else name
 
 
 def _build_section(home: Path) -> str:
-    root = _hermes_root(home)
+    root = _hqr_root(home)
     me = _profile_name(home)
 
     roster = _roster(root)
@@ -124,19 +124,19 @@ def _build_section(home: Path) -> str:
 
     return (
         f"{_PROTOCOL_HEADING}\n"
-        "This install runs Bot Mode: each Hermes profile is an agent teammate with "
+        "This install runs Bot Mode: each HQ Runtime profile is an agent teammate with "
         'one canonical "Bot Chat" conversation. To message a teammate, run on the '
         "terminal tool (background=true, notify_on_complete=true), then finish your "
         "turn — the reply arrives later as a new message:\n"
         "```\n"
-        f'hermes -p <agent-name> chat --in ~ -c "Bot Chat" --create-if-missing -Q -q "Message from 🤖 {handle} (@{handle}): your message"\n'
+        f'hqr -p <agent-name> chat --in ~ -c "Bot Chat" --create-if-missing -Q -q "Message from 🤖 {handle} (@{handle}): your message"\n'
         "```\n"
         f'Always open with the "Message from 🤖 {handle} (@{handle}):" prefix so they '
         "know who is talking. When YOU receive a message with that prefix, you are "
         "being messaged by a teammate agent — address them (not the user) and reply "
         "concisely. When the user says \"ask <name>\" or \"tell <name> ...\", that is a "
         "handoff: message that agent, wait for the reply, and report back, saying "
-        "which agent it came from. Run `hermes profile list` for the LIVE teammate "
+        "which agent it came from. Run `hqr profile list` for the LIVE teammate "
         f"list before a handoff. Teammates at session start: {teammates}."
     )
 
@@ -145,10 +145,10 @@ def get_bot_mode_protocol_section(home: str | os.PathLike | None = None, *, forc
     """Cached probe entry point — one filesystem pass per (process, home).
 
     ``home`` should be the AGENT'S OWN resolved home (session-db derived),
-    not the ambient HERMES_HOME — build threads can lose the ContextVar
+    not the ambient HQR_HOME — build threads can lose the ContextVar
     override and the env var would then name the wrong profile.
     """
-    resolved = str(home) if home else (os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes"))
+    resolved = str(home) if home else (os.getenv("HQR_HOME") or os.path.expanduser("~/.hqr"))
     with _lock:
         if force_refresh or resolved not in _cached:
             try:
@@ -188,19 +188,19 @@ def capability_fingerprint(home: str | os.PathLike | None = None) -> str:
     import hashlib
     import json
 
-    resolved = Path(str(home) if home else (os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes")))
+    resolved = Path(str(home) if home else (os.getenv("HQR_HOME") or os.path.expanduser("~/.hqr")))
     surface: dict = {}
     try:
         # Canonical loader (managed overlay + env expansion + normalization),
         # scoped to the bot's home via the override the loaders already honor.
-        from hermes_cli.config import load_config_readonly
-        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from hqr_cli.config import load_config_readonly
+        from hqr_constants import reset_hqr_home_override, set_hqr_home_override
 
-        token = set_hermes_home_override(str(resolved))
+        token = set_hqr_home_override(str(resolved))
         try:
             cfg = load_config_readonly() or {}
         finally:
-            reset_hermes_home_override(token)
+            reset_hqr_home_override(token)
         skills_cfg = cfg.get("skills") if isinstance(cfg.get("skills"), dict) else {}
         tools_cfg = cfg.get("tools") if isinstance(cfg.get("tools"), dict) else {}
         skills_cfg = skills_cfg or {}
@@ -226,7 +226,7 @@ def capability_fingerprint(home: str | os.PathLike | None = None) -> str:
     except Exception:
         surface["skills"] = []
     try:
-        root = _hermes_root(resolved)
+        root = _hqr_root(resolved)
         surface["roster"] = sorted(n for n, d in _roster(root) if _is_bot_managed(d))
     except Exception:
         surface["roster"] = []

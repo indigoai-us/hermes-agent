@@ -1,1 +1,1 @@
-# Hermes plugins package
+# HQ Runtime plugins package

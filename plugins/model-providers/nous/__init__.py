@@ -21,7 +21,7 @@ class NousProfile(ProviderProfile):
         fallback, so this is cheap to call and safe offline.
         """
         try:
-            from hermes_cli.models import get_nous_recommended_aux_model
+            from hqr_cli.models import get_nous_recommended_aux_model
 
             return get_nous_recommended_aux_model(vision=vision) or ""
         except Exception:
@@ -91,11 +91,11 @@ nous = NousProfile(
     aliases=("nous-portal", "nousresearch"),
     env_vars=("NOUS_API_KEY",),
     display_name="Nous Research",
-    description="Nous Research — Hermes model family",
+    description="Nous Research — HQ Runtime model family",
     signup_url="https://nousresearch.com/",
     fallback_models=(
-        "hermes-3-405b",
-        "hermes-3-70b",
+        "hqr-3-405b",
+        "hqr-3-70b",
     ),
     base_url="https://inference-api.nousresearch.com/v1",
     auth_type="oauth_device_code",

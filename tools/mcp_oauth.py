@@ -11,7 +11,7 @@ which handles discovery, dynamic client registration, PKCE, token exchange,
 refresh, and step-up authorization automatically.
 
 This module provides the glue:
-    - ``HermesTokenStorage``: persists tokens/client-info to disk so they
+    - ``HqrTokenStorage``: persists tokens/client-info to disk so they
       survive across process restarts.
     - Callback server: ephemeral localhost HTTP server to capture the OAuth
       redirect with the authorization code.
@@ -31,7 +31,7 @@ Configuration in config.yaml::
           redirect_port: 0                      # 0 = auto-pick free port
           redirect_uri: "https://proxy/callback"  # default: loopback callback
           redirect_host: "localhost"            # loopback hostname (WAF-safe)
-          client_name: "My Custom Client"       # default: "Hermes Agent"
+          client_name: "My Custom Client"       # default: "HQ Runtime Agent"
 """
 
 import asyncio
@@ -52,7 +52,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
-from hermes_constants import secure_parent_dir
+from hqr_constants import secure_parent_dir
 
 logger = logging.getLogger(__name__)
 
@@ -173,7 +173,7 @@ _SKIP_TOKENS = frozenset({"skip", "cancel", "s", "n", "no", "q", "quit"})
 # _wait_for_callback maps this to OAuthNonInteractiveError ("user_skipped")
 # so the MCP setup path treats it as a non-fatal "continue without this
 # server" rather than a hard failure.
-_USER_SKIPPED_SENTINEL = "__hermes_user_skipped__"
+_USER_SKIPPED_SENTINEL = "__hqr_user_skipped__"
 
 
 # ---------------------------------------------------------------------------
@@ -181,15 +181,15 @@ _USER_SKIPPED_SENTINEL = "__hermes_user_skipped__"
 # ---------------------------------------------------------------------------
 
 
-def _get_token_dir(hermes_home: str | Path | None = None) -> Path:
+def _get_token_dir(hqr_home: str | Path | None = None) -> Path:
     """Return the directory for MCP OAuth token files.
 
-    Uses HERMES_HOME so each profile gets its own OAuth tokens.
-    Layout: ``HERMES_HOME/mcp-tokens/``
+    Uses HQR_HOME so each profile gets its own OAuth tokens.
+    Layout: ``HQR_HOME/mcp-tokens/``
     """
-    from hermes_constants import get_hermes_home
+    from hqr_constants import get_hqr_home
 
-    base = Path(hermes_home) if hermes_home is not None else Path(get_hermes_home())
+    base = Path(hqr_home) if hqr_home is not None else Path(get_hqr_home())
     return base / "mcp-tokens"
 
 
@@ -242,11 +242,11 @@ def _reserve_callback_port() -> int:
     return port
 
 
-def _cached_redirect_port(storage: "HermesTokenStorage | None") -> int | None:
+def _cached_redirect_port(storage: "HqrTokenStorage | None") -> int | None:
     """Return the loopback callback port from cached client registration.
 
     OAuth providers bind a dynamically-registered ``client_id`` to the exact
-    redirect URI that was registered with it. If Hermes restarts and chooses a
+    redirect URI that was registered with it. If HQ Runtime restarts and chooses a
     new random callback port while reusing the stored ``client_id``, providers
     such as Summ reject the authorization request with ``redirect_uri does not
     match any registered URIs``. Reusing the cached redirect port keeps the
@@ -277,7 +277,7 @@ def _cached_redirect_port(storage: "HermesTokenStorage | None") -> int | None:
     return None
 
 
-def _cached_redirect_uri(storage: "HermesTokenStorage | None") -> str | None:
+def _cached_redirect_uri(storage: "HqrTokenStorage | None") -> str | None:
     """Return a cached non-loopback redirect URI, if one was registered."""
     if storage is None:
         return None
@@ -311,13 +311,13 @@ def _raise_if_non_interactive(lead: str) -> None:
     """Raise ``OAuthNonInteractiveError`` unless an interactive session exists.
 
     ``lead`` is the boundary-specific first sentence; this helper appends the
-    shared, actionable ``hermes mcp login`` next-step so the guidance wording
+    shared, actionable ``hqr mcp login`` next-step so the guidance wording
     lives in one place across every non-interactive OAuth boundary (#57836).
     """
     if not _is_interactive():
         raise OAuthNonInteractiveError(
             f"{lead} "
-            "Run `hermes mcp login <server>` interactively to (re)authorize, "
+            "Run `hqr mcp login <server>` interactively to (re)authorize, "
             "then restart or reload the gateway."
         )
 
@@ -422,32 +422,32 @@ def _write_json(path: Path, data: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# HermesTokenStorage -- persistent token/client-info on disk
+# HqrTokenStorage -- persistent token/client-info on disk
 # ---------------------------------------------------------------------------
 
 
-class HermesTokenStorage:
+class HqrTokenStorage:
     """Persist OAuth tokens and client registration to JSON files.
 
     File layout::
 
-        HERMES_HOME/mcp-tokens/<server_name>.json         -- tokens
-        HERMES_HOME/mcp-tokens/<server_name>.client.json   -- client info
-        HERMES_HOME/mcp-tokens/<server_name>.meta.json     -- oauth server metadata
+        HQR_HOME/mcp-tokens/<server_name>.json         -- tokens
+        HQR_HOME/mcp-tokens/<server_name>.client.json   -- client info
+        HQR_HOME/mcp-tokens/<server_name>.meta.json     -- oauth server metadata
     """
 
-    def __init__(self, server_name: str, *, hermes_home: str | Path | None = None):
+    def __init__(self, server_name: str, *, hqr_home: str | Path | None = None):
         self._server_name = _safe_filename(server_name)
-        self._hermes_home = Path(hermes_home) if hermes_home is not None else None
+        self._hqr_home = Path(hqr_home) if hqr_home is not None else None
 
     def _tokens_path(self) -> Path:
-        return _get_token_dir(self._hermes_home) / f"{self._server_name}.json"
+        return _get_token_dir(self._hqr_home) / f"{self._server_name}.json"
 
     def _client_info_path(self) -> Path:
-        return _get_token_dir(self._hermes_home) / f"{self._server_name}.client.json"
+        return _get_token_dir(self._hqr_home) / f"{self._server_name}.client.json"
 
     def _meta_path(self) -> Path:
-        return _get_token_dir(self._hermes_home) / f"{self._server_name}.meta.json"
+        return _get_token_dir(self._hqr_home) / f"{self._server_name}.meta.json"
 
     # -- tokens ------------------------------------------------------------
 
@@ -457,7 +457,7 @@ class HermesTokenStorage:
             return None
         if OAuthToken is None and not _ensure_sdk_loaded():
             return None
-        # Hermes records an absolute wall-clock ``expires_at`` alongside the
+        # HQ Runtime records an absolute wall-clock ``expires_at`` alongside the
         # SDK's serialized token (see ``set_tokens``). On read we rewrite
         # ``expires_in`` to the remaining seconds so the SDK's downstream
         # ``update_token_expiry`` computes the correct absolute time and
@@ -609,7 +609,7 @@ class HermesTokenStorage:
         self.remove()
         if not snapshot:
             return
-        token_dir = _get_token_dir(self._hermes_home)
+        token_dir = _get_token_dir(self._hqr_home)
         token_dir.mkdir(parents=True, exist_ok=True)
         for fname, data in snapshot.items():
             path = token_dir / fname
@@ -717,7 +717,7 @@ def _make_callback_handler() -> tuple[type, dict]:
 
             body = (
                 "<html><body><h2>Authorization Successful</h2>"
-                "<p>You can close this tab and return to Hermes.</p></body></html>"
+                "<p>You can close this tab and return to HQ Runtime.</p></body></html>"
             ) if code else (
                 "<html><body><h2>Authorization Failed</h2>"
                 f"<p>Error: {error or 'unknown'}</p></body></html>"
@@ -1031,7 +1031,7 @@ def _paste_callback_reader(result: dict) -> None:
             return
         result["error"] = _USER_SKIPPED_SENTINEL
         print(
-            "  OAuth skipped. Run `hermes mcp login <server>` later to "
+            "  OAuth skipped. Run `hqr mcp login <server>` later to "
             "authenticate, or set ``enabled: false`` on that server in "
             "config.yaml to disable persistently.",
             file=sys.stderr,
@@ -1084,17 +1084,17 @@ def _paste_callback_reader(result: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
-HermesOAuthClientProvider: Any = None
+HqrOAuthClientProvider: Any = None
 
 
-def _get_hermes_oauth_provider_class() -> type | None:
-    global HermesOAuthClientProvider
-    if HermesOAuthClientProvider is not None:
-        return HermesOAuthClientProvider
+def _get_hqr_oauth_provider_class() -> type | None:
+    global HqrOAuthClientProvider
+    if HqrOAuthClientProvider is not None:
+        return HqrOAuthClientProvider
     if not _ensure_sdk_loaded():
         return None
 
-    class _HermesOAuthClientProvider(OAuthClientProvider):
+    class _HqrOAuthClientProvider(OAuthClientProvider):
         """OAuth provider with pragmatic fixes for real-world MCP providers.
 
         Supabase MCP dynamic registration returns ``client_secret`` but omits
@@ -1166,10 +1166,10 @@ def _get_hermes_oauth_provider_class() -> type | None:
                 self.context.clear_tokens()
                 return False
 
-    _HermesOAuthClientProvider.__name__ = "HermesOAuthClientProvider"
-    _HermesOAuthClientProvider.__qualname__ = "HermesOAuthClientProvider"
-    HermesOAuthClientProvider = _HermesOAuthClientProvider
-    return HermesOAuthClientProvider
+    _HqrOAuthClientProvider.__name__ = "HqrOAuthClientProvider"
+    _HqrOAuthClientProvider.__qualname__ = "HqrOAuthClientProvider"
+    HqrOAuthClientProvider = _HqrOAuthClientProvider
+    return HqrOAuthClientProvider
 
 
 # ---------------------------------------------------------------------------
@@ -1180,10 +1180,10 @@ def _get_hermes_oauth_provider_class() -> type | None:
 def remove_oauth_tokens(
     server_name: str,
     *,
-    hermes_home: str | Path | None = None,
+    hqr_home: str | Path | None = None,
 ) -> None:
     """Delete stored OAuth tokens and client info for a server."""
-    storage = HermesTokenStorage(server_name, hermes_home=hermes_home)
+    storage = HqrTokenStorage(server_name, hqr_home=hqr_home)
     storage.remove()
     logger.info("OAuth tokens removed for '%s'", server_name)
 
@@ -1199,7 +1199,7 @@ def remove_oauth_tokens(
 
 def _configure_callback_port(
     cfg: dict,
-    storage: "HermesTokenStorage | None" = None,
+    storage: "HqrTokenStorage | None" = None,
 ) -> int:
     """Pick or validate the OAuth callback port.
 
@@ -1276,7 +1276,7 @@ def _resolve_redirect_uri(cfg: dict, port: int) -> str:
 # of 2026-07, verified by live call against api.figma.com):
 #   "Claude Code" → 200
 #   "Codex"       → 200
-#   "Hermes Agent" / "Hermes" / "Cursor" / "VS Code" / … → 403
+#   "HQ Runtime Agent" / "HQ Runtime" / "Cursor" / "VS Code" / … → 403
 # pi-figma-remote-auth and similar tools work around this the same way — register
 # under an allowlisted name so the browser flow can start. User can still pin a
 # different name via oauth.client_name if Figma ever admits one.
@@ -1348,7 +1348,7 @@ def _build_client_metadata(cfg: dict) -> "OAuthClientMetadata":
         )
     if OAuthClientMetadata is None:
         _ensure_sdk_loaded()
-    client_name = cfg.get("client_name", "Hermes Agent")
+    client_name = cfg.get("client_name", "HQ Runtime Agent")
     scope = cfg.get("scope")
     redirect_uri = _resolve_redirect_uri(cfg, port)
 
@@ -1366,7 +1366,7 @@ def _build_client_metadata(cfg: dict) -> "OAuthClientMetadata":
         "token_endpoint_auth_method": auth_method,
         # SEP-837 (2026-07-28 spec): clients MUST declare an application_type
         # during registration so OIDC-strict authorization servers stop
-        # rejecting loopback redirect_uris. Hermes is a CLI/desktop app
+        # rejecting loopback redirect_uris. HQ Runtime is a CLI/desktop app
         # redirecting to 127.0.0.1/localhost — that is exactly "native".
         # Overridable for the rare hosted-dashboard deployment fronting a
         # real https redirect.
@@ -1385,7 +1385,7 @@ def _build_client_metadata(cfg: dict) -> "OAuthClientMetadata":
 
 
 def _invalidate_tokens_on_client_change(
-    storage: "HermesTokenStorage",
+    storage: "HqrTokenStorage",
     new_client_id: str,
     new_client_secret: str | None,
 ) -> None:
@@ -1399,7 +1399,7 @@ def _invalidate_tokens_on_client_change(
     the ``invalid_client`` auto-poison path (config-supplied identity can't
     be healed by re-registration), so without this check the stale tokens
     wedge every request until the user manually wipes
-    ``~/.hermes/mcp-tokens/<server>.*``.
+    ``~/.hqr/mcp-tokens/<server>.*``.
 
     Compares the on-disk ``client.json`` identity against the incoming
     config identity BEFORE the new client info overwrites it. Matching
@@ -1433,14 +1433,14 @@ def _invalidate_tokens_on_client_change(
         logger.warning(
             "MCP OAuth '%s': configured OAuth client changed (client_id %r "
             "-> %r); discarded tokens minted under the previous client. "
-            "Re-authorize with: hermes mcp login %s",
+            "Re-authorize with: hqr mcp login %s",
             storage._server_name, old_client_id, new_client_id,
             storage._server_name,
         )
 
 
 def _maybe_preregister_client(
-    storage: "HermesTokenStorage",
+    storage: "HqrTokenStorage",
     cfg: dict,
     client_metadata: "OAuthClientMetadata",
 ) -> None:
@@ -1486,9 +1486,9 @@ def humanize_oauth_registration_error(
     Returns a humanized message when the error is a registration 403/Forbidden,
     else ``None`` so the caller keeps the original exception text.
 
-    Figma's remote MCP gates DCR on exact ``client_name``. Hermes auto-sets
+    Figma's remote MCP gates DCR on exact ``client_name``. HQ Runtime auto-sets
     ``Claude Code`` (known-good); this message fires when the user overrode
-    that with something Figma still rejects, or an older Hermes is running.
+    that with something Figma still rejects, or an older HQ Runtime is running.
     """
     msg = str(exc)
     lowered = msg.lower()
@@ -1509,11 +1509,11 @@ def humanize_oauth_registration_error(
         return (
             f"'{server_name}' is Figma's remote MCP — DCR is allowlisted by "
             f"exact client_name (\"{_FIGMA_DCR_CLIENT_NAME}\" and \"Codex\" "
-            "work; most other names 403). Hermes defaults to "
+            "work; most other names 403). HQ Runtime defaults to "
             f"client_name: {_FIGMA_DCR_CLIENT_NAME!r} automatically. If you "
             "set oauth.client_name yourself, change it to one of those, or "
             "clear it and re-run:\n"
-            f"  hermes mcp login {server_name}"
+            f"  hqr mcp login {server_name}"
         )
 
     return (
@@ -1559,14 +1559,14 @@ def build_oauth_auth(
     apply_oauth_provider_defaults(
         cfg, server_name=server_name, server_url=server_url
     )
-    storage = HermesTokenStorage(server_name)
+    storage = HqrTokenStorage(server_name)
 
     if not _is_interactive() and not storage.has_cached_tokens():
         raise OAuthNonInteractiveError(
             "MCP OAuth for "
             f"'{server_name}': non-interactive environment and no cached tokens "
             "found. The OAuth flow requires browser authorization. Run "
-            f"`hermes mcp login {server_name}` interactively first to complete "
+            f"`hqr mcp login {server_name}` interactively first to complete "
             "initial authorization, then cached tokens will be reused."
         )
 
@@ -1583,7 +1583,7 @@ def build_oauth_auth(
         resolved_port, timeout=float(cfg.get("timeout", 300))
     )
 
-    provider_class = _get_hermes_oauth_provider_class()
+    provider_class = _get_hqr_oauth_provider_class()
     if provider_class is None:
         logger.warning(
             "MCP OAuth requested for '%s' but the provider class is unavailable",

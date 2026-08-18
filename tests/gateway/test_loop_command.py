@@ -10,7 +10,7 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
-from hermes_cli import loops
+from hqr_cli import loops
 
 
 class _FakeSessionEntry:
@@ -30,9 +30,9 @@ class _FakeSessionStore:
 
 @pytest.fixture
 def loop_env(tmp_path, monkeypatch):
-    home = tmp_path / ".hermes"
+    home = tmp_path / ".hqr"
     home.mkdir()
-    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HQR_HOME", str(home))
     loops._DB_CACHE.clear()
     yield home
     loops._DB_CACHE.clear()
@@ -96,7 +96,7 @@ async def test_gateway_loop_status_pause_stop(loop_env):
 
 @pytest.mark.asyncio
 async def test_gateway_loop_goal_note_when_goal_active(loop_env):
-    from hermes_cli.goals import GoalManager
+    from hqr_cli.goals import GoalManager
 
     GoalManager(session_id="sid-gateway-loop").set("finish the migration")
     runner = _make_runner()

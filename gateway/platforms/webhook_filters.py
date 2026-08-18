@@ -27,34 +27,34 @@ def _stringify_filter_value(value: Any) -> str:
 
 
 def _resolve_profile_path(path_value: Any) -> Optional[Path]:
-    """Resolve a user path, mapping ~/.hermes to the active profile home."""
+    """Resolve a user path, mapping ~/.hqr to the active profile home."""
     if not isinstance(path_value, str):
         return None
     raw = os.path.expandvars(path_value.strip())
     if not raw:
         return None
-    from hermes_constants import get_hermes_home
+    from hqr_constants import get_hqr_home
 
-    hermes_home = get_hermes_home()
-    if raw == "~/.hermes":
-        return hermes_home
-    if raw.startswith("~/.hermes/"):
-        return hermes_home / raw.removeprefix("~/.hermes/")
+    hqr_home = get_hqr_home()
+    if raw == "~/.hqr":
+        return hqr_home
+    if raw.startswith("~/.hqr/"):
+        return hqr_home / raw.removeprefix("~/.hqr/")
     path = Path(raw).expanduser()
     if path.is_absolute():
         return path
-    return hermes_home / path
+    return hqr_home / path
 
 
 def _resolve_script_path(script_value: Any) -> tuple[Optional[Path], Optional[str]]:
-    """Resolve a route script under HERMES_HOME/scripts."""
+    """Resolve a route script under HQR_HOME/scripts."""
     if not isinstance(script_value, str) or not script_value.strip():
         return None, "script path is empty"
-    from hermes_constants import get_hermes_home
+    from hqr_constants import get_hqr_home
 
-    scripts_root = (get_hermes_home() / "scripts").resolve()
+    scripts_root = (get_hqr_home() / "scripts").resolve()
     raw_text = os.path.expandvars(script_value.strip())
-    if raw_text == "~/.hermes" or raw_text.startswith("~/.hermes/"):
+    if raw_text == "~/.hqr" or raw_text.startswith("~/.hqr/"):
         mapped = _resolve_profile_path(raw_text)
         candidate = mapped.resolve() if mapped is not None else scripts_root
     else:
@@ -296,7 +296,7 @@ class WebhookRouteProcessor:
             return False, None
         if (
             transformed.get("[SILENT]") is True
-            or transformed.get("__hermes_ignore__") is True
+            or transformed.get("__hqr_ignore__") is True
         ):
             return False, None
         return True, transformed

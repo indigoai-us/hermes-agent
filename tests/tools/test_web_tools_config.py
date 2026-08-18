@@ -120,7 +120,7 @@ class TestBackendSelection:
     """Test suite for _get_backend() backend selection logic.
 
     The backend is configured via config.yaml (web.backend), set by
-    ``hermes tools``.  Falls back to key-based detection for legacy/manual
+    ``hqr tools``.  Falls back to key-based detection for legacy/manual
     setups.
     """
 
@@ -564,9 +564,9 @@ class TestNonBuiltinProviderAvailability:
 
 
 class TestFirecrawlEnvResolution:
-    """Verify Firecrawl reads env values from hermes_cli.config.get_env_value,
+    """Verify Firecrawl reads env values from hqr_cli.config.get_env_value,
     not just os.getenv.  This catches the regression reported in #40190 where
-    values stored in ~/.hermes/.env were invisible to the provider."""
+    values stored in ~/.hqr/.env were invisible to the provider."""
 
     def test_direct_config_reads_via_get_env_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """_get_direct_firecrawl_config() must use get_env_value, not os.getenv."""
@@ -576,7 +576,7 @@ class TestFirecrawlEnvResolution:
 
         fake_key = "fc-test-key-from-dotenv"
         with patch(
-            "hermes_cli.config.get_env_value",
+            "hqr_cli.config.get_env_value",
             side_effect=lambda k: fake_key if k == "FIRECRAWL_API_KEY" else None,
         ):
             from plugins.web.firecrawl.provider import _get_direct_firecrawl_config
@@ -593,7 +593,7 @@ class TestFirecrawlEnvResolution:
 
         fake_url = "https://firecrawl.internal.example.com"
         with patch(
-            "hermes_cli.config.get_env_value",
+            "hqr_cli.config.get_env_value",
             side_effect=lambda k: fake_url if k == "FIRECRAWL_API_URL" else None,
         ):
             from plugins.web.firecrawl.provider import _get_direct_firecrawl_config
@@ -607,7 +607,7 @@ class TestFirecrawlEnvResolution:
 class TestSiblingProvidersEnvResolution:
     """The same #40190 bug class widened: every keyed web provider must
     resolve its credential through the config-aware lookup (os.environ OR
-    ~/.hermes/.env), not bare os.getenv. Parametrized over the four
+    ~/.hqr/.env), not bare os.getenv. Parametrized over the four
     providers that previously read only the process environment."""
 
     _CASES = [
@@ -631,7 +631,7 @@ class TestSiblingProvidersEnvResolution:
         assert provider.is_available() is False
 
         with patch(
-            "hermes_cli.config.get_env_value",
+            "hqr_cli.config.get_env_value",
             side_effect=lambda k: "test-key-from-dotenv" if k == env_key else None,
         ):
             assert provider.is_available() is True, (
@@ -642,7 +642,7 @@ class TestSiblingProvidersEnvResolution:
 
     def test_get_provider_env_unset_returns_empty(self, monkeypatch):
         monkeypatch.delenv("WSP_TEST_UNSET_KEY", raising=False)
-        with patch("hermes_cli.config.get_env_value", return_value=None):
+        with patch("hqr_cli.config.get_env_value", return_value=None):
             from agent.web_search_provider import get_provider_env
 
             assert get_provider_env("WSP_TEST_UNSET_KEY") == ""

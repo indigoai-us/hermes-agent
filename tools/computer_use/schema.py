@@ -306,7 +306,7 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                     "computer_use.grant_existing_profile: true (if refused, "
                     "report that key to the user — you cannot grant it); "
                     "bounded mode authorizes via the reviewed capability "
-                    "manifest; explicit Hermes YOLO uses a private "
+                    "manifest; explicit HQ Runtime YOLO uses a private "
                     "unrestricted daemon."
                 ),
             },

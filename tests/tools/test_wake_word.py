@@ -1,4 +1,4 @@
-"""Tests for tools.wake_word — the "Hey Hermes" hotword detector.
+"""Tests for tools.wake_word — the "Hey HQ Runtime" hotword detector.
 
 No live audio or network: the sounddevice import is faked, engines are stubbed,
 and lazy-dep availability is monkeypatched. Covers config resolution, engine
@@ -35,8 +35,8 @@ def test_config_defaults_and_clamping():
     # Invalid input falls back to the configured default, not a hardcoded 0.5.
     assert ww._sensitivity({"sensitivity": "nope"}) == ww._DEFAULTS["sensitivity"]
     assert ww._sensitivity({}) == ww._DEFAULTS["sensitivity"]
-    assert ww.wake_phrase({"phrase": "hey hermes"}) == "hey hermes"
-    assert ww.wake_phrase({}) == "hey hermes"
+    assert ww.wake_phrase({"phrase": "hey hqr"}) == "hey hqr"
+    assert ww.wake_phrase({}) == "hey hqr"
 
 
 def test_wake_surface_enabled_gate():
@@ -70,7 +70,7 @@ def test_load_wake_word_config_is_a_dict_with_defaults():
 
 def test_load_wake_word_config_guards_non_dict(monkeypatch):
     monkeypatch.setattr(
-        "hermes_cli.config.load_config", lambda: {"wake_word": "oops"}
+        "hqr_cli.config.load_config", lambda: {"wake_word": "oops"}
     )
     assert ww.load_wake_word_config() == {}
 
@@ -102,11 +102,11 @@ def test_requirements_openwakeword_available(monkeypatch):
     monkeypatch.setattr(ww, "_audio_available", lambda: True)
     monkeypatch.setattr("tools.lazy_deps.is_available", lambda f: True)
     r = ww.check_wake_word_requirements(
-        {"provider": "openwakeword", "phrase": "hey hermes"}
+        {"provider": "openwakeword", "phrase": "hey hqr"}
     )
     assert r["available"] is True
     assert r["provider"] == "openwakeword"
-    assert r["phrase"] == "hey hermes"
+    assert r["phrase"] == "hey hqr"
 
 
 def test_tts_ready_is_a_probe_never_an_installer(monkeypatch):
@@ -227,8 +227,8 @@ def test_openwakeword_ensures_base_models_for_custom_path(monkeypatch):
     assert eng._labels == ["hey_hermes"]
 
 
-def test_bundled_hey_hermes_model_ships_on_disk():
-    # The "hey hermes" wake word works out of the box only if the model is
+def test_bundled_hey_hqr_model_ships_on_disk():
+    # The "hey hqr" wake word works out of the box only if the model is
     # actually bundled. Both framework artifacts must exist and be non-trivial.
     for framework in ("onnx", "tflite"):
         path = ww._bundled_wakeword_path(framework)

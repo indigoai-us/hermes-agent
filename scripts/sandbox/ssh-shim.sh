@@ -10,4 +10,4 @@
 #
 # GIT_UPLOAD_PACK is substituted by dev-sandbox.sh when it installs this shim,
 # because the host's git-upload-pack is not necessarily on the sandbox PATH.
-exec @GIT_UPLOAD_PACK@ /work/repos/hermes-agent.git
+exec @GIT_UPLOAD_PACK@ /work/repos/hqr-agent.git

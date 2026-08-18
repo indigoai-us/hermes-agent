@@ -1,6 +1,6 @@
 """Regression: interactive CLI must not lose the Dangerous Command panel.
 
-When ``HERMES_EXEC_ASK`` leaks into a classic CLI process (historically via
+When ``HQR_EXEC_ASK`` leaks into a classic CLI process (historically via
 ``import gateway.run`` setting the flag at module import), the ask/gateway
 branch used to return ``pending_approval`` immediately with no notify
 listener and skip the CLI approval callback. Users saw tools "auto-block"
@@ -30,14 +30,14 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 @pytest.fixture(autouse=True)
 def _clean_approval_env(monkeypatch):
     for key in (
-        "HERMES_EXEC_ASK",
-        "HERMES_GATEWAY_SESSION",
-        "HERMES_SESSION_PLATFORM",
-        "HERMES_CRON_SESSION",
-        "HERMES_YOLO_MODE",
+        "HQR_EXEC_ASK",
+        "HQR_GATEWAY_SESSION",
+        "HQR_SESSION_PLATFORM",
+        "HQR_CRON_SESSION",
+        "HQR_YOLO_MODE",
     ):
         monkeypatch.delenv(key, raising=False)
-    monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+    monkeypatch.setenv("HQR_INTERACTIVE", "1")
     monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
     monkeypatch.setattr(
         approval_module,
@@ -59,7 +59,7 @@ def _clean_approval_env(monkeypatch):
 class TestCliApprovalSurvivesExecAskLeak:
     def test_cli_callback_used_when_exec_ask_set_without_notifier(self, monkeypatch):
         """Ask-mode with a CLI callback must prompt locally, not pending_approval."""
-        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+        monkeypatch.setenv("HQR_EXEC_ASK", "1")
         calls = []
 
         def _cb(command, description, **kwargs):
@@ -77,8 +77,8 @@ class TestCliApprovalSurvivesExecAskLeak:
 
     def test_pending_approval_still_used_without_cli_callback(self, monkeypatch):
         """Headless ask-mode without a CLI callback keeps the pending fallback."""
-        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
-        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.setenv("HQR_EXEC_ASK", "1")
+        monkeypatch.delenv("HQR_INTERACTIVE", raising=False)
         set_approval_callback(None)
 
         result = check_all_command_guards("rm -rf /tmp/testdir", "local")
@@ -93,14 +93,14 @@ class TestGatewayRunImportDoesNotSetExecAsk:
         """Incidental imports must not poison CLI ask-mode process-wide."""
         script = r"""
 import os, sys
-os.environ.pop("HERMES_EXEC_ASK", None)
+os.environ.pop("HQR_EXEC_ASK", None)
 sys.path.insert(0, %r)
 # Avoid starting the gateway; only import the module for _gateway_runner_ref
 # style side imports.
 import gateway.run  # noqa: F401
-print("EXEC_ASK=" + repr(os.environ.get("HERMES_EXEC_ASK")))
+print("EXEC_ASK=" + repr(os.environ.get("HQR_EXEC_ASK")))
 """ % (str(REPO_ROOT),)
-        hermes_home = tmp_path / "import-test-home"
+        hqr_home = tmp_path / "import-test-home"
         proc = subprocess.run(
             [sys.executable, "-c", script],
             cwd=str(REPO_ROOT),
@@ -108,7 +108,7 @@ print("EXEC_ASK=" + repr(os.environ.get("HERMES_EXEC_ASK")))
             text=True,
             env={
                 **os.environ,
-                "HERMES_HOME": str(hermes_home),
+                "HQR_HOME": str(hqr_home),
             },
             timeout=60,
         )

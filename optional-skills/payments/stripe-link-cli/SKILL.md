@@ -2,11 +2,11 @@
 name: stripe-link-cli
 description: Agent payments via Stripe Link — cards, SPT, approvals.
 version: 0.1.0
-author: Teknium (teknium1), Hermes Agent
+author: Teknium (teknium1), HQ Runtime Agent
 license: MIT
 platforms: [linux, macos]
 metadata:
-  hermes:
+  hqr:
     tags: [Payments, Stripe, Link, Checkout, MPP]
     related_skills: [mpp-agent, stripe-projects]
 ---
@@ -33,7 +33,7 @@ If the user wants a paid API call (HTTP 402, no checkout form), the `card` path 
 - Node.js 20+ available on `PATH` (`node --version`)
 - US-based (Link account requirement)
 
-The Link account, payment method, and spend-approval app do NOT need to be set up before Hermes attempts to pay — the CLI walks the user through them on first run:
+The Link account, payment method, and spend-approval app do NOT need to be set up before HQ Runtime attempts to pay — the CLI walks the user through them on first run:
 
 - A Link account at https://app.link.com — created/linked during first `link-cli` auth
 - At least one payment method — added during first run at https://app.link.com/wallet
@@ -69,7 +69,7 @@ link-cli auth status
 If not authenticated, log in with a clear client name (this label shows in the user's Link app):
 
 ```
-link-cli auth login --client-name "Hermes" --interval 5 --timeout 300
+link-cli auth login --client-name "HQ Runtime" --interval 5 --timeout 300
 ```
 
 The `--interval`/`--timeout` form polls inline so the agent doesn't need to manage a `_next` step. Print the verification URL + phrase to the user and wait for the CLI to return.
@@ -158,13 +158,13 @@ rm -f /tmp/link-card.json
 
 ## Optional: run as an MCP server instead
 
-`@stripe/link-cli --mcp` exposes the same commands as MCP tools over stdio. To register it with Hermes' native MCP:
+`@stripe/link-cli --mcp` exposes the same commands as MCP tools over stdio. To register it with HQ Runtime' native MCP:
 
 ```
-hermes mcp add stripe-link --command "npx" --args "@stripe/link-cli --mcp"
+hqr mcp add stripe-link --command "npx" --args "@stripe/link-cli --mcp"
 ```
 
-Then `hermes mcp list` should show `stripe-link`. The same approval rules apply — MCP doesn't bypass the Link app approval step.
+Then `hqr mcp list` should show `stripe-link`. The same approval rules apply — MCP doesn't bypass the Link app approval step.
 
 ## Pitfalls
 

@@ -119,39 +119,39 @@ class TestCodingContextBlock:
 class TestNamedProfileHintIntegration:
     """The same defect through the REAL resolution chain (#72894).
 
-    ``TestNamedProfileHint`` mocks ``get_hermes_home``,
-    ``get_default_hermes_root`` and ``_resolve_active_profile_name``, so it
+    ``TestNamedProfileHint`` mocks ``get_hqr_home``,
+    ``get_default_hqr_root`` and ``_resolve_active_profile_name``, so it
     validates template rendering but not the relationship that causes the bug:
     ``_resolve_active_profile_name`` returns a named profile *only* when the
     active home is already ``<root>/profiles/<name>``, which is exactly why
     appending that suffix again doubled it. Drive it with a real
-    ``HERMES_HOME`` and no resolver mocks.
+    ``HQR_HOME`` and no resolver mocks.
     """
 
-    def test_real_hermes_home_under_profiles_renders_correct_paths(
+    def test_real_hqr_home_under_profiles_renders_correct_paths(
         self, tmp_path, monkeypatch
     ):
-        root = tmp_path / ".hermes"
+        root = tmp_path / ".hqr"
         profile_home = root / "profiles" / "coder"
         profile_home.mkdir(parents=True)
 
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
-        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        monkeypatch.setenv("HQR_HOME", str(profile_home))
         monkeypatch.delenv("TERMINAL_CWD", raising=False)
 
         # Sanity-check the real chain before asserting on the prompt.
         from agent.file_safety import _resolve_active_profile_name
-        from hermes_constants import get_default_hermes_root, get_hermes_home
+        from hqr_constants import get_default_hqr_root, get_hqr_home
 
         assert _resolve_active_profile_name() == "coder"
-        assert get_hermes_home() == profile_home
-        assert get_default_hermes_root() == root
+        assert get_hqr_home() == profile_home
+        assert get_default_hqr_root() == root
 
         agent = _make_agent(valid_tool_names=["read_file"])
         with patch("agent.coding_context._coding_mode", return_value="off"):
             prompt = "\n\n".join(_prompt_parts(agent).values())
 
-        assert "Active Hermes profile: coder." in prompt
+        assert "Active HQ Runtime profile: coder." in prompt
         assert f"reads and writes {profile_home}/." in prompt
         # The doubled form must not appear anywhere.
         assert f"{profile_home}/profiles/coder" not in prompt
@@ -160,12 +160,12 @@ class TestNamedProfileHintIntegration:
         assert f"{profile_home}/skills/" not in prompt
 
     def test_real_default_home_renders_default_branch(self, tmp_path, monkeypatch):
-        """HERMES_HOME at the root resolves to the default profile, unchanged."""
-        root = tmp_path / ".hermes"
+        """HQR_HOME at the root resolves to the default profile, unchanged."""
+        root = tmp_path / ".hqr"
         root.mkdir(parents=True)
 
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
-        monkeypatch.setenv("HERMES_HOME", str(root))
+        monkeypatch.setenv("HQR_HOME", str(root))
         monkeypatch.delenv("TERMINAL_CWD", raising=False)
 
         from agent.file_safety import _resolve_active_profile_name
@@ -176,7 +176,7 @@ class TestNamedProfileHintIntegration:
         with patch("agent.coding_context._coding_mode", return_value="off"):
             prompt = "\n\n".join(_prompt_parts(agent).values())
 
-        assert "Active Hermes profile: default." in prompt
+        assert "Active HQ Runtime profile: default." in prompt
         assert f"under {root}/profiles/<name>/." in prompt
 
 
@@ -203,13 +203,13 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
         _parallel_tool_call_guidance=False,
     )
     monkeypatch.setattr(system_prompt, "DEFAULT_AGENT_IDENTITY", "IDENTITY")
-    monkeypatch.setattr(system_prompt, "HERMES_AGENT_HELP_GUIDANCE", "HELP")
+    monkeypatch.setattr(system_prompt, "HQR_AGENT_HELP_GUIDANCE", "HELP")
     monkeypatch.setattr(system_prompt, "STEER_CHANNEL_NOTE", "STEER")
-    monkeypatch.setattr(system_prompt, "get_hermes_home", lambda: Path("/hermes"))
+    monkeypatch.setattr(system_prompt, "get_hqr_home", lambda: Path("/hqr"))
 
     expected_profile = (
-        "Active Hermes profile: default. Other profiles (if any) live "
-        "under /hermes/profiles/<name>/. Each profile has its own skills/, "
+        "Active HQ Runtime profile: default. Other profiles (if any) live "
+        "under /hqr/profiles/<name>/. Each profile has its own skills/, "
         "plugins/, cron/, and memories/ that affect a different session than "
         "this one. Do not modify another profile's skills/plugins/cron/memories "
         "unless the user explicitly directs you to."
@@ -241,7 +241,7 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
             ),
         ),
         patch("agent.file_safety._resolve_active_profile_name", return_value="default"),
-        patch("hermes_time.now", return_value=datetime(2026, 1, 2)),
+        patch("hqr_time.now", return_value=datetime(2026, 1, 2)),
     ):
         prompt = build_system_prompt(agent, system_message="SYSTEM_MESSAGE")
 
@@ -255,7 +255,7 @@ class TestTelegramRichMessagesHint:
     def test_base_hint_without_rich_messages(self, monkeypatch):
         """When rich_messages is False, only the base hint is used."""
         agent = _make_agent(platform="telegram")
-        with patch("hermes_cli.config.load_config_readonly") as mock_cfg:
+        with patch("hqr_cli.config.load_config_readonly") as mock_cfg:
             mock_cfg.return_value = {
                 "gateway": {"platforms": {"telegram": {"extra": {"rich_messages": False}}}}
             }
@@ -268,7 +268,7 @@ class TestTelegramRichMessagesHint:
         """When rich_messages is True in gateway.platforms, the extension
         is appended (the canonical/primary location)."""
         agent = _make_agent(platform="telegram")
-        with patch("hermes_cli.config.load_config_readonly") as mock_cfg:
+        with patch("hqr_cli.config.load_config_readonly") as mock_cfg:
             mock_cfg.return_value = {
                 "gateway": {"platforms": {"telegram": {"extra": {"rich_messages": True}}}}
             }
@@ -281,7 +281,7 @@ class TestTelegramRichMessagesHint:
         """Top-level ``platforms.telegram.extra.rich_messages`` is merged
         alongside gateway.platforms, so it works on its own."""
         agent = _make_agent(platform="telegram")
-        with patch("hermes_cli.config.load_config_readonly") as mock_cfg:
+        with patch("hqr_cli.config.load_config_readonly") as mock_cfg:
             mock_cfg.return_value = {
                 "platforms": {"telegram": {"extra": {"rich_messages": True}}}
             }
@@ -293,7 +293,7 @@ class TestTelegramRichMessagesHint:
         """Top-level ``platforms.telegram.extra`` wins over gateway.platforms
         at the leaf, matching the adapter's merge precedence."""
         agent = _make_agent(platform="telegram")
-        with patch("hermes_cli.config.load_config_readonly") as mock_cfg:
+        with patch("hqr_cli.config.load_config_readonly") as mock_cfg:
             mock_cfg.return_value = {
                 "gateway": {"platforms": {"telegram": {"extra": {"rich_messages": False}}}},
                 "platforms": {"telegram": {"extra": {"rich_messages": True}}},
@@ -305,7 +305,7 @@ class TestTelegramRichMessagesHint:
         """When gateway.platforms.telegram.extra has other keys but not
         rich_messages, the top-level rich_messages still activates."""
         agent = _make_agent(platform="telegram")
-        with patch("hermes_cli.config.load_config_readonly") as mock_cfg:
+        with patch("hqr_cli.config.load_config_readonly") as mock_cfg:
             mock_cfg.return_value = {
                 "gateway": {"platforms": {"telegram": {"extra": {"disable_link_previews": True}}}},
                 "platforms": {"telegram": {"extra": {"rich_messages": True}}},
@@ -316,7 +316,7 @@ class TestTelegramRichMessagesHint:
     def test_base_hint_without_config(self, monkeypatch):
         """When config has no telegram section, only base hint is used."""
         agent = _make_agent(platform="telegram")
-        with patch("hermes_cli.config.load_config_readonly") as mock_cfg:
+        with patch("hqr_cli.config.load_config_readonly") as mock_cfg:
             mock_cfg.return_value = {}
             stable = _stable_prompt(agent)
         assert "Standard Markdown is automatically converted" in stable
@@ -325,7 +325,7 @@ class TestTelegramRichMessagesHint:
 
     def test_gateway_rich_messages_integration_via_real_config(self, tmp_path, monkeypatch):
         """End-to-end through the real config-resolution chain: a config.yaml
-        under HERMES_HOME with ``gateway.platforms.telegram.extra.rich_messages``
+        under HQR_HOME with ``gateway.platforms.telegram.extra.rich_messages``
         must activate the rich hint. ``load_config_readonly`` is NOT mocked here,
         so this guards against the exact path-mismatch bug this PR fixes.
         """
@@ -336,14 +336,14 @@ class TestTelegramRichMessagesHint:
             "      extra:\n"
             "        rich_messages: true\n"
         )
-        home = tmp_path / "hermes_home"
+        home = tmp_path / "hqr_home"
         home.mkdir()
         (home / "config.yaml").write_text(config_yaml)
 
-        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HQR_HOME", str(home))
         # Point config resolution at the temp file without mocking the loader:
         # mirror the pattern used in test_config_env_expansion.py.
-        from hermes_cli import config as _cfgmod
+        from hqr_cli import config as _cfgmod
         monkeypatch.setattr(_cfgmod, "get_config_path", lambda: home / "config.yaml")
 
         agent = _make_agent(platform="telegram")
@@ -356,7 +356,7 @@ class TestTelegramRichMessagesHint:
         it should fail open to the base hint (Tek's fail-open concern).
         """
         agent = _make_agent(platform="telegram")
-        with patch("hermes_cli.config.load_config_readonly") as mock_cfg:
+        with patch("hqr_cli.config.load_config_readonly") as mock_cfg:
             mock_cfg.return_value = {
                 "gateway": {"platforms": {"telegram": {"extra": "not-a-map"}}}
             }

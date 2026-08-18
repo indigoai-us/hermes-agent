@@ -26,7 +26,7 @@ from agent.trace_upload import (
 
 def _sample_messages():
     return [
-        {"role": "system", "content": "you are hermes"},
+        {"role": "system", "content": "you are hqr"},
         {"role": "user", "content": "list files"},
         {"role": "assistant", "content": "Listing.", "tool_calls": [
             {"id": "call_1", "function": {"name": "terminal", "arguments": '{"command": "ls"}'}},
@@ -101,7 +101,7 @@ def test_converter_keeps_secrets_when_redact_disabled():
 def test_load_session_messages_closes_database_on_failure(monkeypatch):
     db = MagicMock()
     db.resolve_session_id.side_effect = RuntimeError("read failed")
-    monkeypatch.setattr("hermes_state.SessionDB", lambda: db)
+    monkeypatch.setattr("hqr_state.SessionDB", lambda: db)
 
     with pytest.raises(RuntimeError, match="read failed"):
         load_session_messages("s1")
@@ -155,7 +155,7 @@ def test_upload_happy_path_mocked(monkeypatch):
     # Created private dataset repo
     fake_api.create_repo.assert_called_once()
     _, kwargs = fake_api.create_repo.call_args
-    assert kwargs["repo_id"] == "alice/hermes-traces"
+    assert kwargs["repo_id"] == "alice/hqr-traces"
     assert kwargs["repo_type"] == "dataset"
     assert kwargs["private"] is True
 
@@ -163,7 +163,7 @@ def test_upload_happy_path_mocked(monkeypatch):
     fake_api.upload_file.assert_called_once()
     _, ukwargs = fake_api.upload_file.call_args
     assert ukwargs["path_in_repo"] == "sessions/20260531_abc.jsonl"
-    assert ukwargs["repo_id"] == "alice/hermes-traces"
+    assert ukwargs["repo_id"] == "alice/hqr-traces"
     body = ukwargs["path_or_fileobj"]
     if isinstance(body, bytes):
         body = body.decode("utf-8")

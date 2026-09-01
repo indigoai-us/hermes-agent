@@ -1447,6 +1447,16 @@ def handle_function_call(
                     function_args = modified_args
             except Exception as _hook_err:
                 logger.debug("pre_tool_call hook error: %s", _hook_err)
+                # Dispatcher-level fail-closed (agent.hooks_dispatcher_fail_closed):
+                # same posture as the tool_executor path — a broken dispatcher
+                # must not silently open the policy gate.
+                from agent.hook_flags import (
+                    dispatcher_fail_closed_message,
+                    hooks_dispatcher_fail_closed,
+                )
+
+                if hooks_dispatcher_fail_closed():
+                    block_message = dispatcher_fail_closed_message(_hook_err)
 
             if block_message is not None:
                 result = tool_error(block_message)

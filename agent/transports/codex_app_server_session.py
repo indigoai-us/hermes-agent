@@ -282,8 +282,12 @@ class CodexAppServerSession:
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
+        developer_instructions: Optional[str] = None,
     ) -> None:
         self._cwd = cwd or os.getcwd()
+        # Optional developer message for thread/start (protocol v2). Keeps
+        # codex's own base instructions intact — see agent.codex_flags.
+        self._developer_instructions = (developer_instructions or "").strip()
         self._codex_bin = codex_bin
         self._codex_home = codex_home
         self._permission_profile = (
@@ -343,7 +347,24 @@ class CodexAppServerSession:
         # Users who want a write-capable profile configure it in their
         # ~/.codex/config.toml the same way they would for any codex usage.
         params: dict[str, Any] = {"cwd": self._cwd}
-        result = self._client.request("thread/start", params, timeout=15)
+        if self._developer_instructions:
+            # Protocol v2 slot for client-supplied context; codex keeps its
+            # own base instructions. Older codex builds that reject the
+            # field get one retry without it — context loss beats a dead
+            # thread, and the warning names what was dropped.
+            params["developerInstructions"] = self._developer_instructions
+        try:
+            result = self._client.request("thread/start", params, timeout=15)
+        except CodexAppServerError:
+            if "developerInstructions" not in params:
+                raise
+            logger.warning(
+                "codex thread/start rejected developerInstructions "
+                "(older codex protocol?) — retrying without forwarded "
+                "system context"
+            )
+            params.pop("developerInstructions", None)
+            result = self._client.request("thread/start", params, timeout=15)
         # Cross-fill thread.id/sessionId — different codex versions have
         # serialized this under either key. Mirrors openclaw beta.8's
         # tolerance fix so future codex drops/renames don't KeyError us

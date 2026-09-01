@@ -687,6 +687,9 @@ def run_codex_app_server_turn(
     messages: List[Dict[str, Any]],
     effective_task_id: str,
     should_review_memory: bool = False,
+    system_prompt: str = "",
+    plugin_user_context: str = "",
+    ext_prefetch_cache: str = "",
 ) -> Dict[str, Any]:
     """Codex app-server runtime path. Hands the entire turn to a `codex
     app-server` subprocess and projects its events back into Hermes'
@@ -694,6 +697,11 @@ def run_codex_app_server_turn(
 
     Called from run_conversation() when agent.api_mode == "codex_app_server".
     Returns the same dict shape as the chat_completions path.
+
+    ``system_prompt`` / ``plugin_user_context`` / ``ext_prefetch_cache`` are
+    the Hermes-side context the standard loop would have sent; forwarded to
+    codex only behind the opt-in :mod:`agent.codex_flags` flags (default:
+    dropped, the historical behavior).
     """
     # Defense in depth for compression.checkpoint_required: agent init
     # already refuses this combination, but api_mode is a plain attribute a
@@ -758,6 +766,24 @@ def run_codex_app_server_turn(
         # users see no live tool-progress or interim commentary while
         # codex_app_server is running — only the final answer (#33200).
         # Supersedes the narrower item/started-only bridge from #38835.
+        # Opt-in context bridge (agent.codex_flags): forward the Hermes
+        # system prompt as the thread's developer message. Evaluated once
+        # per session — matching the standard loop, whose system prompt is
+        # also frozen at session start; mid-session refreshes ride the
+        # composed turn input below.
+        _developer_instructions = None
+        try:
+            from agent.codex_flags import codex_forward_system_prompt
+
+            if codex_forward_system_prompt() and system_prompt.strip():
+                _developer_instructions = system_prompt
+        except Exception:
+            logger.warning(
+                "codex context bridge: system-prompt flag lookup failed; "
+                "not forwarding",
+                exc_info=True,
+            )
+
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
             approval_callback=approval_callback,
@@ -766,14 +792,41 @@ def run_codex_app_server_turn(
                 auto_approve_apply_patch=auto_approve_requests,
             ),
             on_event=make_codex_app_server_event_bridge(agent),
+            developer_instructions=_developer_instructions,
         )
 
     # NOTE: the user message is ALREADY appended to messages by the
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
+    # Opt-in context bridge: compose the turn input exactly like the
+    # standard loop composes the API copy of the user message (memory
+    # prefetch + pre_llm_call plugin context). API-only — `messages`
+    # keeps the clean user text, matching the api_content sidecar
+    # semantics of the standard path.
+    _turn_input = user_message
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        from agent.codex_flags import codex_forward_plugin_context
+
+        if codex_forward_plugin_context() and (
+            plugin_user_context or ext_prefetch_cache
+        ):
+            from agent.turn_context import compose_user_api_content
+
+            _composed = compose_user_api_content(
+                user_message, ext_prefetch_cache, plugin_user_context
+            )
+            if isinstance(_composed, str) and _composed:
+                _turn_input = _composed
+    except Exception:
+        logger.warning(
+            "codex context bridge: plugin-context composition failed; "
+            "sending the raw user message",
+            exc_info=True,
+        )
+
+    try:
+        turn = agent._codex_session.run_turn(user_input=_turn_input)
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn

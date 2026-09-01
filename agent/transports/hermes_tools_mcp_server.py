@@ -151,6 +151,31 @@ EXPOSED_TOOLS: tuple[str, ...] = (
 )
 
 
+def _exposed_tools() -> tuple[str, ...]:
+    """EXPOSED_TOOLS plus deployment-selected extras.
+
+    ``HERMES_MCP_EXTRA_TOOLS`` (comma-separated registered tool names) lets
+    a deployment expose additional plugin-registered tools to the codex
+    runtime without forking this list — plugin tools are otherwise
+    invisible to codex-owned turns. Opt-in per process, mirroring the
+    HERMES_KANBAN_TASK env-gating precedent above. Names that are not
+    registered in this Hermes process are skipped by the existing
+    not-registered guard, so a stale entry can never crash the server.
+    The same caution as the comment above applies: only expose tools whose
+    dispatch is stateless (no running-AIAgent context), because this
+    callback dispatches outside the agent loop.
+    """
+    extra = os.environ.get("HERMES_MCP_EXTRA_TOOLS", "")
+    if not extra.strip():
+        return EXPOSED_TOOLS
+    merged = list(EXPOSED_TOOLS)
+    for name in extra.split(","):
+        name = name.strip()
+        if name and name not in merged:
+            merged.append(name)
+    return tuple(merged)
+
+
 def _build_server() -> Any:
     """Create the MCP server with Hermes tools attached. Lazy imports
     so the module can be imported without the mcp package installed
@@ -191,7 +216,8 @@ def _build_server() -> Any:
 
     exposed_count = 0
 
-    for name in EXPOSED_TOOLS:
+    exposure = _exposed_tools()
+    for name in exposure:
         spec = all_defs.get(name)
         if spec is None:
             logger.debug(
@@ -245,7 +271,7 @@ def _build_server() -> Any:
     logger.info(
         "hermes-tools MCP server registered %d/%d tools",
         exposed_count,
-        len(EXPOSED_TOOLS),
+        len(exposure),
     )
     return mcp
 

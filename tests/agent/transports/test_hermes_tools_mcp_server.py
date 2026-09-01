@@ -146,3 +146,32 @@ class TestMain:
         monkeypatch.setattr(m, "_build_server", lambda: CrashingServer())
         rc = m.main([])
         assert rc == 1
+
+
+class TestExtraToolsEnv:
+    """HERMES_MCP_EXTRA_TOOLS extends the exposure set (hq/v2 patch P6)."""
+
+    def test_default_is_exact_exposed_tools(self, monkeypatch):
+        from agent.transports import hermes_tools_mcp_server as m
+
+        monkeypatch.delenv("HERMES_MCP_EXTRA_TOOLS", raising=False)
+        assert m._exposed_tools() == m.EXPOSED_TOOLS
+
+    def test_extra_names_appended_deduped(self, monkeypatch):
+        from agent.transports import hermes_tools_mcp_server as m
+
+        monkeypatch.setenv(
+            "HERMES_MCP_EXTRA_TOOLS",
+            " hq_search , hq_dm, web_search ,, hq_search ",
+        )
+        exposure = m._exposed_tools()
+        assert exposure[: len(m.EXPOSED_TOOLS)] == m.EXPOSED_TOOLS
+        assert exposure[len(m.EXPOSED_TOOLS):] == ("hq_search", "hq_dm")
+        # Duplicates of built-ins never repeat.
+        assert exposure.count("web_search") == 1
+
+    def test_blank_env_is_inert(self, monkeypatch):
+        from agent.transports import hermes_tools_mcp_server as m
+
+        monkeypatch.setenv("HERMES_MCP_EXTRA_TOOLS", "   ")
+        assert m._exposed_tools() == m.EXPOSED_TOOLS

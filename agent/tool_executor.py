@@ -661,7 +661,17 @@ def _run_agent_tool_execution_middleware(
                         final_args = modified_args
                         state["args"] = modified_args
                     return block_msg
-                except Exception:
+                except Exception as exc:
+                    # A DISPATCHER failure (import error, hook-plumbing bug) is
+                    # distinct from a hook failure: per-hook fail_closed cannot
+                    # see it, so without the flag the tool would run unblocked.
+                    from agent.hook_flags import (
+                        dispatcher_fail_closed_message,
+                        hooks_dispatcher_fail_closed,
+                    )
+
+                    if hooks_dispatcher_fail_closed():
+                        return dispatcher_fail_closed_message(exc)
                     return None
 
             block_message = (

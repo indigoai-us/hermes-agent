@@ -8587,11 +8587,11 @@ def run_conversation(
                 _edited = sorted(getattr(agent, "_turn_file_mutation_paths", set()) or [])
                 _attempt = getattr(agent, "_pre_verify_nudges", 0)
                 try:
-                    from agent.verify_hooks import max_verify_nudges
+                    from agent.verify_hooks import max_verify_nudges, pre_verify_always
                     from hermes_cli.lifecycle import has_hook
                     from hermes_cli.plugins import get_pre_verify_continue_message
 
-                    if _edited and has_hook("pre_verify") and _attempt < max_verify_nudges():
+                    if (_edited or pre_verify_always()) and has_hook("pre_verify") and _attempt < max_verify_nudges():
                         # Posture is fixed for the session — resolve once + cache.
                         coding = getattr(agent, "_resolved_is_coding", None)
                         if coding is None:

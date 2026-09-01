@@ -51,3 +51,19 @@ class TestCodingVerifyGuidance:
     def test_opt_out_via_config(self):
         off = {"agent": {"verify_guidance": False}}
         assert verify_hooks.coding_verify_guidance(off) is None
+
+
+class TestPreVerifyAlways:
+    """``agent.pre_verify_always`` — fire pre_verify on non-editing turns too."""
+
+    def test_default_off_preserves_the_edited_gate(self):
+        assert verify_hooks.pre_verify_always({}) is False
+        assert verify_hooks.pre_verify_always({"agent": {}}) is False
+
+    def test_truthy_config_enables(self):
+        assert verify_hooks.pre_verify_always({"agent": {"pre_verify_always": True}}) is True
+        assert verify_hooks.pre_verify_always({"agent": {"pre_verify_always": "true"}}) is True
+
+    def test_garbage_config_stays_off(self):
+        assert verify_hooks.pre_verify_always({"agent": {"pre_verify_always": "sometimes"}}) is False
+        assert verify_hooks.pre_verify_always({"agent": "nope"}) is False

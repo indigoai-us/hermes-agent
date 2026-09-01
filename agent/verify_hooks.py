@@ -42,6 +42,20 @@ def max_verify_nudges(config: Optional[dict[str, Any]] = None) -> int:
         return DEFAULT_MAX_VERIFY_NUDGES
 
 
+def pre_verify_always(config: Optional[dict[str, Any]] = None) -> bool:
+    """Fire ``pre_verify`` on EVERY turn, not only file-editing ones.
+
+    The default gate (``_edited``) keeps the hook's token cost tied to coding
+    turns. Operators using ``pre_verify`` as a universal Stop gate — e.g.
+    Claude-Code-style ``decision: block`` policy hooks that must also vet
+    conversational turns — opt in with ``agent.pre_verify_always: true``.
+    ``max_verify_nudges`` still bounds consecutive continues either way.
+    """
+    return is_truthy_value(
+        _agent_cfg(config).get("pre_verify_always", False), default=False
+    )
+
+
 def coding_verify_guidance(config: Optional[dict[str, Any]] = None) -> Optional[str]:
     """Return the optional guidance appended to verification-stop nudges."""
     if not is_truthy_value(_agent_cfg(config).get("verify_guidance", True), default=True):

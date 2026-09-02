@@ -80,3 +80,146 @@ class TestModelToolsDispatcherFailClosed:
         # Unchanged legacy behavior: the tool runs as if no hook were wired.
         assert result == '{"ok":true}'
         dispatch.assert_called_once()
+
+
+class TestShellReentrantFlagParsing:
+    def test_defaults_off(self):
+        from agent.hook_flags import hooks_shell_reentrant
+
+        assert hooks_shell_reentrant({}) is False
+        assert hooks_shell_reentrant({"agent": {}}) is False
+
+    def test_truthy_agent_config_enables(self):
+        from agent.hook_flags import hooks_shell_reentrant
+
+        assert hooks_shell_reentrant({"agent": {"hooks_shell_reentrant": True}}) is True
+        assert hooks_shell_reentrant({"agent": {"hooks_shell_reentrant": "true"}}) is True
+
+    def test_malformed_config_is_off(self):
+        from agent.hook_flags import hooks_shell_reentrant
+
+        assert hooks_shell_reentrant({"agent": "nope"}) is False
+        assert hooks_shell_reentrant({"agent": {"hooks_shell_reentrant": "garbage"}}) is False
+
+
+class TestShellHookReentrancy:
+    """P6: two in-flight fires of one shell-hook callback must not refuse the second.
+
+    The dispatcher single-flights every callback under the timeout path: while
+    one fire is running, a second fire of the same callback is skipped, and a
+    skipped ``pre_tool_call`` fails closed (the tool is refused). Shell hooks
+    are one subprocess per fire with their own timeout + process-tree kill, so
+    the agent's parallel tool batches were being refused for no reason (live
+    2026-09-02: 10 of 12 pre_tool_call fires). With the flag on, a callback
+    marked ``hermes_reentrant`` runs concurrently; with it off, stock behavior.
+    """
+
+    @staticmethod
+    def _slow_reentrant_callback(release):
+        def _cb(**_kwargs):
+            release.wait(timeout=10.0)
+            return None
+
+        _cb.__name__ = "shell_hook[pre_tool_call:/x/adapter.sh pre_tool_call]"
+        _cb.hermes_reentrant = True
+        return _cb
+
+    @staticmethod
+    def _two_concurrent_fires(mgr, monkeypatch, release):
+        import threading
+
+        import hermes_cli.plugins as plugins_mod
+        from hermes_cli.plugins import resolve_pre_tool_block
+
+        monkeypatch.setattr(plugins_mod, "_plugin_manager", mgr)
+        results = {}
+
+        def _fire(tag):
+            results[tag] = resolve_pre_tool_block("read_file", {"path": tag})
+
+        t1 = threading.Thread(target=_fire, args=("a",))
+        t2 = threading.Thread(target=_fire, args=("b",))
+        t1.start()
+        # Let the first fire register as running before the second arrives.
+        import time
+
+        time.sleep(0.15)
+        t2.start()
+        time.sleep(0.15)
+        release.set()
+        t1.join(timeout=5.0)
+        t2.join(timeout=5.0)
+        return results
+
+    def test_flag_on_second_concurrent_fire_is_not_refused(self, monkeypatch):
+        import threading
+
+        from hermes_cli.plugins import PluginManager
+
+        monkeypatch.setattr("hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 2.0)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {"agent": {"hooks_shell_reentrant": True}},
+        )
+        release = threading.Event()
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [self._slow_reentrant_callback(release)]
+
+        results = self._two_concurrent_fires(mgr, monkeypatch, release)
+
+        assert results["a"] is None
+        assert results["b"] is None, "second concurrent fire was refused"
+        assert not mgr._hook_running_callbacks, "running-callback bookkeeping leaked"
+
+    def test_flag_off_keeps_stock_single_flight(self, monkeypatch):
+        import threading
+
+        from hermes_cli.plugins import (
+            _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE,
+            PluginManager,
+        )
+
+        monkeypatch.setattr("hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 2.0)
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {"agent": {}})
+        release = threading.Event()
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [self._slow_reentrant_callback(release)]
+
+        results = self._two_concurrent_fires(mgr, monkeypatch, release)
+
+        assert results["a"] is None
+        assert results["b"] == _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE
+
+    def test_flag_on_does_not_unblock_non_reentrant_callbacks(self, monkeypatch):
+        import threading
+
+        from hermes_cli.plugins import (
+            _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE,
+            PluginManager,
+        )
+
+        monkeypatch.setattr("hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 2.0)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {"agent": {"hooks_shell_reentrant": True}},
+        )
+        release = threading.Event()
+
+        def plain_python_policy(**_kwargs):
+            release.wait(timeout=10.0)
+            return None
+
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [plain_python_policy]
+
+        results = self._two_concurrent_fires(mgr, monkeypatch, release)
+
+        assert results["a"] is None
+        assert results["b"] == _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE
+
+    def test_shell_hook_callbacks_carry_the_marker(self):
+        from agent.shell_hooks import ShellHookSpec, _make_callback
+
+        spec = ShellHookSpec(event="pre_tool_call", command="/x/adapter.sh pre_tool_call")
+        cb = _make_callback(spec)
+        assert getattr(cb, "hermes_reentrant", False) is True

@@ -5606,6 +5606,22 @@ class PluginManager:
         timeout = _resolve_hook_callback_timeout()
         use_timeout = _hook_uses_callback_timeout(hook_name, timeout)
         fail_closed = hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
+        # Fork patch P6 (agent.hooks_shell_reentrant, default off): callbacks
+        # that mark themselves ``hermes_reentrant`` (agent/shell_hooks.py — one
+        # subprocess per fire, own timeout, process-tree kill) may run
+        # concurrently. Stock single-flights every callback, so with parallel
+        # tool calls the second fire sees "still running" and, for
+        # pre_tool_call, is refused outright. Resolved once per dispatch via
+        # the cached readonly loader (same idiom as the timeout above).
+        reentrant_ok = False
+        if use_timeout and callbacks:
+            try:
+                from agent.hook_flags import hooks_shell_reentrant
+                from hermes_cli.config import load_config_readonly
+
+                reentrant_ok = hooks_shell_reentrant(load_config_readonly() or {})
+            except Exception:
+                reentrant_ok = False
 
         for cb in callbacks:
             callback_name = getattr(cb, "__name__", repr(cb))
@@ -5619,6 +5635,14 @@ class PluginManager:
                             callback_key
                         )
                         running = callback_key in self._hook_running_callbacks
+                        if (
+                            running
+                            and reentrant_ok
+                            and getattr(cb, "hermes_reentrant", False)
+                        ):
+                            # An in-flight shell hook is not a stuck hook; the
+                            # post-timeout suppression window below still is.
+                            running = False
                         if (
                             suppressed_until is not None and suppressed_until > now
                         ) or running:

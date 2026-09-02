@@ -32,6 +32,25 @@ def hooks_dispatcher_fail_closed(config: Optional[dict[str, Any]] = None) -> boo
     )
 
 
+def hooks_shell_reentrant(config: Optional[dict[str, Any]] = None) -> bool:
+    """True when shell-hook callbacks may run concurrently.
+
+    The hook dispatcher single-flights every callback: while one fire is in
+    progress, a second fire of the same callback is *skipped* — and for
+    ``pre_tool_call`` a skip fails closed, so the second tool call is refused
+    with "callback timed out or is still running". That guard exists for
+    in-process Python callbacks that can hang the loop. A shell hook is one
+    subprocess per fire with its own timeout and process-tree kill, so
+    concurrent fires are independent; refusing the second one only turns the
+    agent's parallel tool batches into spurious blocks. Default OFF keeps the
+    stock single-flight for everyone else.
+    """
+    return is_truthy_value(
+        _agent_cfg(config).get("hooks_shell_reentrant", False),
+        default=False,
+    )
+
+
 def dispatcher_fail_closed_message(exc: BaseException) -> str:
     """The block message a dispatcher failure produces (becomes the tool result)."""
     return (
@@ -55,4 +74,5 @@ def _agent_cfg(config: Optional[dict[str, Any]]) -> dict[str, Any]:
 __all__ = [
     "dispatcher_fail_closed_message",
     "hooks_dispatcher_fail_closed",
+    "hooks_shell_reentrant",
 ]

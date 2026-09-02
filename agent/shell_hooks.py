@@ -635,6 +635,11 @@ def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]
 
     _callback.__name__ = f"shell_hook[{spec.event}:{spec.command}]"
     _callback.__qualname__ = _callback.__name__
+    # Each fire is its own subprocess with its own timeout + process-tree
+    # kill, so concurrent fires are independent. The dispatcher honors this
+    # marker (behind ``agent.hooks_shell_reentrant``) instead of
+    # single-flighting the callback and refusing the second fire.
+    _callback.hermes_reentrant = True  # type: ignore[attr-defined]
     return _callback
 
 

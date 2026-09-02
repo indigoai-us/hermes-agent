@@ -165,3 +165,30 @@ def test_thread_start_retries_without_developer_instructions_on_reject():
     assert len(starts) == 2
     assert "developerInstructions" in starts[0][1]
     assert "developerInstructions" not in starts[1][1]
+
+
+# ── interim/final duplicate guard (live 2026-09-02) ─────────────────────────
+
+def test_final_marked_already_sent_when_delivered_as_interim():
+    agent = _make_agent()
+    agent._interim_text_was_delivered = lambda text: text == "OK"
+    result = _run(agent)
+    assert result["already_sent"] is True
+    assert result["final_response"] == "OK"
+
+
+def test_final_not_marked_when_interim_differs():
+    agent = _make_agent()
+    agent._interim_text_was_delivered = lambda text: False
+    result = _run(agent)
+    assert "already_sent" not in result
+
+
+def test_final_not_marked_on_error_turns():
+    agent = _make_agent()
+    turn = _make_turn()
+    turn.error = "boom"
+    agent._codex_session.run_turn.return_value = turn
+    agent._interim_text_was_delivered = lambda text: True
+    result = _run(agent)
+    assert "already_sent" not in result

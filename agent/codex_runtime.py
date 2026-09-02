@@ -993,10 +993,29 @@ def run_codex_app_server_turn(
         except Exception:
             logger.debug("background review spawn raised", exc_info=True)
 
+    # Interim/final duplicate guard (#33200 follow-up, live 2026-09-02): the
+    # event bridge emits every completed agentMessage as interim commentary —
+    # including the LAST one, which IS the final answer. With interim
+    # messages enabled the user has therefore already received the final
+    # text verbatim, and the gateway's normal final-send would post it a
+    # second time (its stream-consumer suppression sees content_delivered=
+    # False because the interim path, not the stream-final path, delivered
+    # it). Mark it already_sent so the gateway skips the duplicate. Exact
+    # delivered-text match only — a transformed/differing final still sends.
+    _final_already_delivered = False
+    if turn.final_text and turn.error is None and not turn.interrupted:
+        try:
+            _was_delivered = getattr(agent, "_interim_text_was_delivered", None)
+            if callable(_was_delivered):
+                _final_already_delivered = bool(_was_delivered(turn.final_text))
+        except Exception:
+            _final_already_delivered = False
+
     return {
         "final_response": turn.final_text,
         "messages": messages,
         "api_calls": api_calls,
+        **({"already_sent": True} if _final_already_delivered else {}),
         "completed": not turn.interrupted and turn.error is None,
         "partial": turn.interrupted or turn.error is not None,
         "interrupted": _user_interrupted,

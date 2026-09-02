@@ -631,10 +631,7 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         except Exception:
             logger.debug("_fire_reasoning_delta raised", exc_info=True)
 
-    def _fire_agent_message_completed(item: dict) -> None:
-        text = item.get("text") or ""
-        if not isinstance(text, str) or not text.strip():
-            return
+    def _deliver_agent_message(text: str) -> None:
         # display.show_commentary=false — mid-turn narration stays off the
         # visible interim path on this runtime too (same contract as the
         # codex_responses commentary channel).
@@ -650,6 +647,27 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
                 "_emit_interim_assistant_message raised", exc_info=True,
             )
 
+    # Lookahead buffer (duplicate-final fix, live 2026-09-02): the LAST
+    # completed agentMessage of a turn IS the final answer, which the
+    # gateway's normal final-send also delivers. Emitting it as interim
+    # commentary races that send by milliseconds — no after-the-fact
+    # already-delivered check can win reliably. So a completed agentMessage
+    # is HELD, delivered as commentary only once a later item-level event
+    # proves the agent kept working, and dropped when the turn ends first
+    # (the normal final send owns it). Cleared on every turn/* boundary so
+    # a stale hold can never leak into the next turn.
+    _held_agent_message: list[str] = []
+
+    def _flush_held_agent_message() -> None:
+        while _held_agent_message:
+            _deliver_agent_message(_held_agent_message.pop(0))
+
+    def _fire_agent_message_completed(item: dict) -> None:
+        text = item.get("text") or ""
+        if not isinstance(text, str) or not text.strip():
+            return
+        _held_agent_message.append(text)
+
     def on_event(note: dict) -> None:
         if not isinstance(note, dict):
             return
@@ -657,6 +675,15 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         params = note.get("params") or {}
         if not isinstance(params, dict):
             params = {}
+        if method.startswith("turn/"):
+            # Turn boundary — a held agentMessage was the final answer;
+            # the gateway's normal final send delivers it. Drop the hold.
+            _held_agent_message.clear()
+            return
+        if method.startswith("item/"):
+            # Any further item activity proves the held message was
+            # mid-turn commentary — deliver it before handling this event.
+            _flush_held_agent_message()
         if method == "item/agentMessage/delta":
             _fire_text_delta(params)
             return

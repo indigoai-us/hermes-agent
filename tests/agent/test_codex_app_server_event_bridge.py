@@ -250,7 +250,10 @@ class TestToolProgressDispatch:
 
 
 class TestAgentMessageInterimDispatch:
-    def test_completed_agent_message_emits_interim(self):
+    def test_completed_agent_message_emits_interim_once_work_continues(self):
+        """Lookahead contract (duplicate-final fix, 2026-09-02): a completed
+        agentMessage is HELD until a later item-level event proves the agent
+        kept working — only then is it commentary, not the final answer."""
         agent = _make_stub_agent()
         bridge = make_codex_app_server_event_bridge(agent)
         bridge(_item_completed({
@@ -258,9 +261,32 @@ class TestAgentMessageInterimDispatch:
             "id": "am-1",
             "text": "I'll check the config first.",
         }))
+        # Held: nothing emitted yet — this could still be the final answer.
+        agent._emit_interim_assistant_message.assert_not_called()
+        # A subsequent tool start proves it was mid-turn commentary.
+        bridge(_item_started({
+            "type": "commandExecution", "id": "ce-1", "command": "ls",
+        }))
         agent._emit_interim_assistant_message.assert_called_once_with(
             {"role": "assistant", "content": "I'll check the config first."}
         )
+
+    def test_final_agent_message_dropped_at_turn_boundary(self):
+        """The LAST agentMessage of a turn is the final answer — the gateway's
+        normal final send owns it; the interim path must never post it
+        (live 2026-09-02: every reply delivered twice on Slack)."""
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_completed({
+            "type": "agentMessage", "id": "am-9", "text": "Final answer.",
+        }))
+        bridge({"method": "turn/completed", "params": {}})
+        agent._emit_interim_assistant_message.assert_not_called()
+        # And the hold cannot leak into the next turn.
+        bridge(_item_started({
+            "type": "commandExecution", "id": "ce-2", "command": "ls",
+        }))
+        agent._emit_interim_assistant_message.assert_not_called()
 
 
 

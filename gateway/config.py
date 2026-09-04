@@ -963,6 +963,19 @@ class GatewayConfig:
     # raw passthrough.
     filter_silence_narration: bool = True
 
+    # Fork patch P9 (hq/v2): master gate for ALL system-generated runtime
+    # lifecycle broadcasts the gateway pushes to a platform unprompted —
+    # shutdown/restart interrupt notices to active sessions, interrupted-cron
+    # notices, the post-restart "gateway restarted" reply, and home-channel
+    # "gateway online" startup banners. When False, none of these leave the
+    # process; lifecycle stays in logs/heartbeat/console only. Default True
+    # reproduces stock upstream behavior (broadcasts sent); HQ fleet boxes
+    # render this false (see hq-agents-v2 config template) so an agent never
+    # posts robotic "⚠️ Gateway shutting down" boilerplate into a customer
+    # channel. Distinct from the per-platform gateway_restart_notification
+    # toggle, which this gate supersedes when off.
+    lifecycle_broadcasts_enabled: bool = True
+
     # STT settings
     stt_enabled: bool = True  # Whether to auto-transcribe inbound voice messages
     stt_echo_transcripts: bool = True  # Whether to echo raw STT transcripts back to the user
@@ -1146,6 +1159,7 @@ class GatewayConfig:
             "write_sessions_json": self.write_sessions_json,
             "always_log_local": self.always_log_local,
             "filter_silence_narration": self.filter_silence_narration,
+            "lifecycle_broadcasts_enabled": self.lifecycle_broadcasts_enabled,
             "stt_enabled": self.stt_enabled,
             "stt_echo_transcripts": self.stt_echo_transcripts,
             "group_sessions_per_user": self.group_sessions_per_user,
@@ -1330,6 +1344,9 @@ class GatewayConfig:
             always_log_local=_coerce_bool(data.get("always_log_local"), True),
             filter_silence_narration=_coerce_bool(
                 data.get("filter_silence_narration"), True
+            ),
+            lifecycle_broadcasts_enabled=_coerce_bool(
+                data.get("lifecycle_broadcasts_enabled"), True
             ),
             stt_enabled=_coerce_bool(stt_enabled, True),
             stt_echo_transcripts=_coerce_bool(stt_echo_transcripts, True),
@@ -1573,6 +1590,17 @@ def load_gateway_config() -> GatewayConfig:
             elif isinstance(gateway_section, dict) and "filter_silence_narration" in gateway_section:
                 gw_data["filter_silence_narration"] = gateway_section[
                     "filter_silence_narration"
+                ]
+
+            # Fork patch P9: lifecycle-broadcast master gate. Top-level wins;
+            # nested gateway.* fallback (matches filter_silence_narration).
+            if "lifecycle_broadcasts_enabled" in yaml_cfg:
+                gw_data["lifecycle_broadcasts_enabled"] = yaml_cfg[
+                    "lifecycle_broadcasts_enabled"
+                ]
+            elif isinstance(gateway_section, dict) and "lifecycle_broadcasts_enabled" in gateway_section:
+                gw_data["lifecycle_broadcasts_enabled"] = gateway_section[
+                    "lifecycle_broadcasts_enabled"
                 ]
 
             if "unauthorized_dm_behavior" in yaml_cfg:

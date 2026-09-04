@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Optional, Union
 
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
+from agent import hq_branding
 from agent.i18n import t
 from agent.turn_context import extract_api_content_sidecar
 from gateway.config import HomeChannel, Platform, PlatformConfig, persist_home_channel
@@ -4327,11 +4328,11 @@ class GatewaySlashCommandsMixin:
                 adapter._busy_text_mode = self._effective_busy_text_mode(event.source)
 
             if arg == "queue":
-                behavior = "Messages will be queued for the next turn while Hermes is busy."
+                behavior = f"Messages will be queued for the next turn while {hq_branding.agent_name()} is busy."
             elif arg == "steer":
                 behavior = "Messages will be steered into the current run (after the next tool call)."
             else:
-                behavior = "Messages will interrupt the current run while Hermes is busy."
+                behavior = f"Messages will interrupt the current run while {hq_branding.agent_name()} is busy."
             return EphemeralReply(
                 f"Busy input mode set to **`{arg}`** (saved)." + "\n"
                 f"_{behavior}_"
@@ -6358,7 +6359,7 @@ class GatewaySlashCommandsMixin:
                 return t("gateway.update.platform_not_messaging")
 
         if is_managed():
-            return f"✗ {format_managed_message('update Hermes Agent')}"
+            return f"✗ {format_managed_message(f'update {hq_branding.update_target_label()}')}"
 
         project_root = Path(__file__).parent.parent.resolve()
         git_dir = project_root / '.git'

@@ -62,6 +62,7 @@ from agent.conversation_compression import (
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.compaction_display import project_compaction_message_for_display
 from agent.i18n import t
+from agent import hq_branding
 from agent.interrupt_compat import request_hard_interrupt
 from agent.turn_context import (
     compression_made_progress,
@@ -5043,7 +5044,7 @@ class TurnRunner:
                 f"- {task['title']} - {labels.get(task['status'], task['status'])}"
                 for task in _visible_tasks()
             ]
-            return "Hermes is working\n" + "\n".join(lines)
+            return f"{hq_branding.agent_name()} is working\n" + "\n".join(lines)
 
         def _apply_native_event(raw: Any) -> bool:
             nonlocal anonymous_seq
@@ -5120,7 +5121,7 @@ class TurnRunner:
                 result = await adapter.send_native_task_card_progress(
                     chat_id=ctx.source.chat_id,
                     tasks=_visible_tasks(),
-                    title="Hermes is working",
+                    title=f"{hq_branding.agent_name()} is working",
                     reply_to=ctx._progress_reply_to,
                     metadata=ctx._progress_metadata,
                     fallback_text=_fallback_text(),
@@ -8504,18 +8505,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _telegram_topic_root_lobby_message(self) -> str:
         return (
             "This main chat is reserved for system commands.\n\n"
-            "To start a new Hermes chat, open the All Messages topic at the top "
+            f"To start a new {hq_branding.agent_name()} chat, open the All Messages topic at the top "
             "of this bot interface and send any message there. Telegram will "
             "create a new topic for that message; each topic works as an "
-            "independent Hermes session."
+            f"independent {hq_branding.agent_name()} session."
         )
 
     def _telegram_topic_root_new_message(self) -> str:
         return (
-            "To start a new parallel Hermes chat, open the All Messages topic "
+            f"To start a new parallel {hq_branding.agent_name()} chat, open the All Messages topic "
             "at the top of this bot interface and send any message there. "
             "Telegram will create a new topic for it.\n\n"
-            "Each topic is an independent Hermes session. Use /new inside an "
+            f"Each topic is an independent {hq_branding.agent_name()} session. Use /new inside an "
             "existing topic only if you want to replace that topic's current session."
         )
 
@@ -8523,7 +8524,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not self._is_telegram_topic_lane(source):
             return None
         return (
-            "Started a new Hermes session in this topic.\n\n"
+            f"Started a new {hq_branding.agent_name()} session in this topic.\n\n"
             "Tip: for parallel work, open All Messages and send a message there "
             "to create a separate topic instead of using /new here. /new replaces "
             "the session attached to the current topic."
@@ -10919,9 +10920,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
             if self._queue_during_drain_enabled(effective_mode):
                 self._queue_or_replace_pending_event(session_key, event)
-                message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+                message = hq_branding.busy_notice(self._restart_requested, queued=True)
             else:
-                message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+                message = hq_branding.busy_notice(self._restart_requested)
 
             await adapter._send_with_retry(
                 chat_id=event.source.chat_id,
@@ -11455,7 +11456,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("Cron interrupt notification unavailable: %s", e)
             return 0
 
-        action = "restarting" if self._restart_requested else "shutting down"
         notified: set = set()
         for job_id in job_ids:
             try:
@@ -11472,10 +11472,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not targets:
                 continue
 
-            msg = (
-                f"⚠️ Cron job '{job.get('name') or job_id}' was interrupted — "
-                f"the gateway is {action} and killed the run before it "
-                "finished. No result was produced for this run."
+            msg = hq_branding.cron_interrupt_notice(
+                job.get("name") or job_id, self._restart_requested
             )
             for target in targets:
                 try:
@@ -11534,14 +11532,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         active = self._snapshot_running_agents()
         restart_source = self._restart_command_source if self._restart_requested else None
 
-        action = "restarting" if self._restart_requested else "shutting down"
-        hint = (
-            "Your current task will be interrupted. "
-            "Send any message after restart and I'll try to resume where you left off."
-            if self._restart_requested
-            else "Your current task will be interrupted."
-        )
-        msg = f"⚠️ Gateway {action} — {hint}"
+        msg = hq_branding.interrupt_notice(self._restart_requested)
 
         notified: set[tuple[str, str, Optional[str]]] = set()
         for session_key in active:
@@ -14848,7 +14839,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # (no permission, topics-mode off, parent is a DM, etc.). When
         # None we fall through to using the home channel directly — the
         # synthetic turn still lands; just without thread isolation.
-        thread_name = f"Hermes — {cli_title}"
+        thread_name = f"{hq_branding.agent_name()} — {cli_title}"
         try:
             new_thread_id = await adapter.create_handoff_thread(
                 str(home.chat_id), thread_name,
@@ -17877,13 +17868,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if args.lower() in {"off", "resume", "stop", "disengage"}:
             if estop.disengage():
                 return "▶️ Resumed — new work is accepted again."
-            return "Hermes wasn't paused."
+            return f"{hq_branding.agent_name()} wasn't paused."
         state = estop.get_state()
         if state is not None and not args:
             reason = state.get("reason")
             suffix = f" (reason: {reason})" if reason else ""
             return (
-                f"⏸️ Hermes is already paused{suffix}. "
+                f"⏸️ {hq_branding.agent_name()} is already paused{suffix}. "
                 "Use `/pause off` to resume."
             )
         estop.engage(reason=args or None)
@@ -18777,10 +18768,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 if queue_during_drain:
                     self._queue_or_replace_pending_event(_quick_key, event)
-                return (
-                    f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
-                    if queue_during_drain
-                    else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+                return hq_branding.busy_notice(
+                    self._restart_requested, queued=queue_during_drain
                 )
             if effective_busy_input_mode == "queue":
                 logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
@@ -19342,7 +19331,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._handle_voice_command(event)
 
         if self._draining:
-            return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
+            return hq_branding.busy_notice(self._restart_requested, new_work=True)
 
         # User-defined quick commands (bypass agent loop, no LLM call)
         if command:
@@ -22078,7 +22067,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 notice = (
                     f"📬 No home channel is set for {platform_name.title()}. "
-                    f"A home channel is where Hermes delivers cron job results "
+                    f"A home channel is where {hq_branding.agent_name()} delivers cron job results "
                     f"and cross-platform messages.\n\n"
                     f"Type {sethome_cmd} to make this chat your home channel, "
                     f"or ignore to skip."
@@ -24740,7 +24729,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             send_result = await adapter.send(
                 source.chat_id,
-                "System topic for Hermes commands and status.",
+                f"System topic for {hq_branding.agent_name()} commands and status.",
                 metadata={"thread_id": str(thread_id)},
             )
             message_id = getattr(send_result, "message_id", None)
@@ -24783,7 +24772,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Return a Bot API-safe forum topic name from a generated session title."""
         cleaned = re.sub(r"\s+", " ", str(title or "")).strip()
         if not cleaned:
-            return "Hermes Chat"
+            return f"{hq_branding.agent_name()} Chat"
         # Telegram forum topic names are short (currently 1-128 chars). Keep
         # extra room for multi-byte titles and avoid trailing ellipsis churn.
         if len(cleaned) > 120:
@@ -24898,7 +24887,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         cleaned = re.sub(r"\s+", " ", str(title or "")).strip()
         if not cleaned:
-            return "Hermes Chat"
+            return f"{hq_branding.agent_name()} Chat"
         if utf16_len(cleaned) > 80:
             cleaned = _prefix_within_utf16_limit(cleaned, 77).rstrip() + "..."
         return cleaned
@@ -25231,11 +25220,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "  /topic <id>        Inside a topic: restore a previous session by ID\n"
             "\n"
             "How it works:\n"
-            "1. Run /topic once in this DM — Hermes checks BotFather Threads\n"
+            f"1. Run /topic once in this DM — {hq_branding.agent_name()} checks BotFather Threads\n"
             "   Settings are enabled and flips on multi-session mode.\n"
             "2. Tap All Messages at the top of the bot and send any message.\n"
             "   Telegram creates a new topic for that message; each topic is\n"
-            "   an independent Hermes session (fresh history, fresh context).\n"
+            f"   an independent {hq_branding.agent_name()} session (fresh history, fresh context).\n"
             "3. The root DM becomes a system lobby — send /topic, /status,\n"
             "   /help, /usage there. Normal prompts go in a topic.\n"
             "4. /new inside a topic resets just that topic's session.\n"
@@ -25275,7 +25264,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "Multi-session topic mode is now OFF for this chat.\n\n"
             "Existing topics in Telegram aren't removed — they'll just stop "
             "being gated as independent sessions. The root DM works as a "
-            "normal Hermes chat again. Run /topic to re-enable later."
+            f"normal {hq_branding.agent_name()} chat again. Run /topic to re-enable later."
         )
 
 
@@ -25283,7 +25272,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         lines = [
             "Telegram multi-session topics are enabled.",
             "",
-            "To create a new Hermes chat, open All Messages at the top of this "
+            f"To create a new {hq_branding.agent_name()} chat, open All Messages at the top of this "
             "bot interface and send any message there. Telegram will create a "
             "new topic for it.",
             "",
@@ -25379,7 +25368,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         response = f"Session restored: {title}"
         if last_assistant:
-            response += f"\n\nLast Hermes message:\n{last_assistant}"
+            response += f"\n\nLast {hq_branding.agent_name()} message:\n{last_assistant}"
         return response
 
 
@@ -25989,13 +25978,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if exit_code == 0:
                         await adapter.send(
                             chat_id,
-                            "✅ Hermes update finished.",
+                            hq_branding.update_finished_notice(),
                             metadata=_non_conversational_metadata(metadata, platform=platform),
                         )
                     else:
                         await adapter.send(
                             chat_id,
-                            "❌ Hermes update failed (exit code {}).".format(exit_code),
+                            hq_branding.update_failed_notice(exit_code=exit_code),
                             metadata=_non_conversational_metadata(metadata, platform=platform),
                         )
                     logger.info("Update finished (exit=%s), notified %s", exit_code, session_key)
@@ -26093,7 +26082,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 await adapter.send(
                     chat_id,
-                    "❌ Hermes update timed out after 30 minutes.",
+                    hq_branding.update_timeout_notice(),
                     metadata=_non_conversational_metadata(metadata, platform=platform),
                 )
             except Exception:
@@ -26196,13 +26185,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if len(output) > 3500:
                         output = "…" + output[-3500:]
                     if exit_code == 0:
-                        msg = f"✅ Hermes update finished.\n\n```\n{output}\n```"
+                        msg = f"{hq_branding.update_finished_notice()}\n\n```\n{output}\n```"
                     else:
-                        msg = f"❌ Hermes update failed.\n\n```\n{output}\n```"
+                        msg = f"{hq_branding.update_failed_notice()}\n\n```\n{output}\n```"
                 elif exit_code == 0:
-                    msg = "✅ Hermes update finished successfully."
+                    msg = hq_branding.update_finished_notice(successfully=True)
                 else:
-                    msg = "❌ Hermes update failed. Check the gateway logs or run `hermes update` manually for details."
+                    msg = hq_branding.update_failed_notice(hint=True)
                 await adapter.send(
                     chat_id,
                     msg,
@@ -26276,7 +26265,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             result = await transport.send(
                 platform,
                 str(chat_id),
-                "♻ Gateway restarted successfully. Your session continues.",
+                hq_branding.restarted_notice(),
                 metadata=_non_conversational_metadata(metadata, platform=platform),
             )
             # adapter.send() catches provider errors (e.g. "Chat not found")
@@ -26317,7 +26306,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         delivered: set[tuple[str, str, Optional[str]]] = set()
         skipped = skip_targets or set()
-        message = "♻️ Gateway online — Hermes is back and ready."
+        message = hq_branding.back_online_notice()
 
         for platform, platform_cfg in self.config.platforms.items():
             home = platform_cfg.home_channel

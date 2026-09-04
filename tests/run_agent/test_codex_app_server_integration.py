@@ -786,3 +786,116 @@ class TestCodexToolProgressBridge:
 
         assert "on_event" in captured_init and captured_init["on_event"] is not None
         assert ("tool.started", "exec_command", "pytest") in events
+
+
+class TestApprovalBridgeWiring:
+    """Fork patch P7: when codex_app_server.approval_bridge is on, the runtime
+    forces auto-approve OFF (even under a box approvals bypass), pins
+    sandbox + approvalPolicy into thread/start, wires the hook-adapter approval
+    callback, and fails closed on an unsafe bridge config."""
+
+    def _capture(self, monkeypatch):
+        captured: dict = {}
+
+        def fake_init(self, **kwargs):
+            captured.update(kwargs)
+            self._thread_id = "thread-stub-1"
+
+        def fake_run_turn(self, user_input: str, **kwargs):
+            return TurnResult(
+                final_text="ok",
+                projected_messages=[{"role": "assistant", "content": "ok"}],
+                turn_id="turn-stub-1",
+                thread_id="thread-stub-1",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "__init__", fake_init)
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession, "ensure_started", lambda self: "thread-stub-1"
+        )
+        return captured
+
+    def _bridge_cfg(self, **cas):
+        base = {
+            "approval_bridge": True,
+            "auto_approve": False,
+            "sandbox": "workspace-write",
+            "approval_policy": "untrusted",
+            "hook_adapter": "/opt/hq/hooks/hq-agents-v2-hook-adapter.sh",
+        }
+        base.update(cas)
+        return {
+            "model": {"provider": "openai-codex",
+                      "openai_runtime": "codex_app_server"},
+            "codex_app_server": base,
+            # Box-side approvals bypass ON — the bridge must override it.
+            "approvals": {"mode": "off"},
+        }
+
+    def test_bridge_forces_routing_off_and_pins_thread_start(self, monkeypatch):
+        captured = self._capture(monkeypatch)
+        with patch(
+            "hermes_cli.config.load_config", return_value=self._bridge_cfg()
+        ), patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value=self._bridge_cfg(),
+        ):
+            agent = _make_codex_agent()
+            with patch.object(
+                agent, "_spawn_background_review", return_value=None
+            ):
+                agent.run_conversation("write something")
+        routing = captured["request_routing"]
+        # Bridge overrides the box approvals bypass.
+        assert routing.auto_approve_exec is False
+        assert routing.auto_approve_apply_patch is False
+        # thread/start pins sandbox + approvalPolicy.
+        assert captured["thread_start_params_extra"] == {
+            "sandbox": "workspace-write",
+            "approvalPolicy": "untrusted",
+        }
+        # The hook-adapter approval callback is wired.
+        assert captured["approval_bridge_callback"] is not None
+
+    def test_bridge_off_keeps_cwd_only_and_no_bridge_callback(self, monkeypatch):
+        captured = self._capture(monkeypatch)
+        # app-server on, but bridge NOT enabled -> stock behavior preserved.
+        cfg = {
+            "model": {"provider": "openai-codex",
+                      "openai_runtime": "codex_app_server"},
+            "approvals": {"mode": "manual"},
+        }
+        with patch(
+            "hermes_cli.config.load_config", return_value=cfg
+        ), patch(
+            "hermes_cli.config.load_config_readonly", return_value=cfg
+        ):
+            agent = _make_codex_agent()
+            with patch.object(
+                agent, "_spawn_background_review", return_value=None
+            ):
+                agent.run_conversation("write something")
+        assert captured["thread_start_params_extra"] == {}
+        assert captured["approval_bridge_callback"] is None
+        routing = captured["request_routing"]
+        assert routing.auto_approve_exec is False
+        assert routing.auto_approve_apply_patch is False
+
+    def test_unsafe_bridge_config_fails_closed(self, monkeypatch):
+        from agent.codex_bridge import BridgeConfigError
+
+        self._capture(monkeypatch)
+        # approval_bridge on but auto_approve True -> unsafe -> must refuse.
+        cfg = self._bridge_cfg(auto_approve=True)
+        with patch(
+            "hermes_cli.config.load_config", return_value=cfg
+        ), patch(
+            "hermes_cli.config.load_config_readonly", return_value=cfg
+        ):
+            agent = _make_codex_agent()
+            with patch.object(
+                agent, "_spawn_background_review", return_value=None
+            ):
+                with pytest.raises(BridgeConfigError):
+                    agent.run_conversation("write something")

@@ -706,6 +706,112 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     return on_event
 
 
+# Fork patch P7 (A10 codex approval bridge). Bounded time budget for the HQ
+# hook adapter that gates each codex-native exec / apply_patch. Generous enough
+# for the adapter to run the real .claude/hooks gate, but bounded so a wedged
+# adapter fails closed instead of hanging the turn.
+_CODEX_APPROVAL_ADAPTER_TIMEOUT_DEFAULT = 30.0
+
+
+def _make_codex_approval_bridge_callback(
+    agent, config: Dict[str, Any]
+) -> Callable[[dict], str]:
+    """Build the HQ approval-bridge callback for the codex app-server (fork
+    patch P7).
+
+    Returns ``callback(request: dict) -> str`` that maps a codex approval
+    request onto a Hermes approval choice by shelling the configured hook
+    adapter with a ``pre_approval_request`` payload. ``request`` is the
+    structured payload built by ``CodexAppServerSession`` —
+    ``{"type": "exec", "command": ..., "cwd": ...}`` or
+    ``{"type": "apply_patch", "paths": [...], "grantRoot": ...}``.
+
+    Contract (matches ``hooks/hq-agents-v2-hook-adapter.sh``
+    ``pre_approval_request`` in hq-agents-v2):
+
+      * exit 0                 => ``"once"`` (approve)
+      * exit 2 / any non-zero  => ``"deny"`` (reason on stderr, logged)
+      * timeout / missing adapter / any error => ``"deny"`` (fail closed)
+
+    Everything that is not a clean exit-0 maps to deny, so a broken, missing,
+    or slow adapter can never approve a codex action.
+    """
+    cas = (config or {}).get("codex_app_server") or {}
+    adapter = str(cas.get("hook_adapter") or "").strip()
+    try:
+        timeout = float(
+            cas.get("approval_timeout")
+            or _CODEX_APPROVAL_ADAPTER_TIMEOUT_DEFAULT
+        )
+    except (TypeError, ValueError):
+        timeout = _CODEX_APPROVAL_ADAPTER_TIMEOUT_DEFAULT
+    if timeout <= 0:
+        timeout = _CODEX_APPROVAL_ADAPTER_TIMEOUT_DEFAULT
+    session_id = getattr(agent, "session_id", None) or "codex-app-server"
+    default_cwd = getattr(agent, "session_cwd", None) or os.getcwd()
+
+    def _callback(request: dict) -> str:
+        import subprocess
+
+        if not adapter:
+            logger.error(
+                "codex approval bridge: no codex_app_server.hook_adapter "
+                "configured — denying %s (fail closed)",
+                (request or {}).get("type"),
+            )
+            return "deny"
+        approval = dict(request or {})
+        payload = {
+            "hook_event_name": "pre_approval_request",
+            "session_id": session_id,
+            "cwd": approval.get("cwd") or default_cwd,
+            "approval": approval,
+        }
+        try:
+            proc = subprocess.run(
+                ["bash", adapter, "pre_approval_request"],
+                input=json.dumps(payload),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except FileNotFoundError:
+            logger.error(
+                "codex approval bridge: hook adapter %r not found — denying "
+                "(fail closed)",
+                adapter,
+            )
+            return "deny"
+        except subprocess.TimeoutExpired:
+            logger.error(
+                "codex approval bridge: hook adapter timed out after %.1fs — "
+                "denying %s (fail closed)",
+                timeout,
+                approval.get("type"),
+            )
+            return "deny"
+        except Exception:
+            logger.exception(
+                "codex approval bridge: hook adapter invocation failed — "
+                "denying (fail closed)"
+            )
+            return "deny"
+        if proc.returncode == 0:
+            return "once"
+        reason = (proc.stderr or "").strip() or "(no reason on stderr)"
+        # codex's decline has no wire slot for a reason string, so surface it
+        # to the operator log; the model sees the action was declined.
+        logger.warning(
+            "codex approval bridge: HQ hook DENIED %s (exit %s): %s",
+            approval.get("type"),
+            proc.returncode,
+            reason,
+        )
+        return "deny"
+
+    return _callback
+
+
 def run_codex_app_server_turn(
     agent,
     *,
@@ -756,6 +862,36 @@ def run_codex_app_server_turn(
         from agent.runtime_cwd import resolve_agent_cwd
 
         cwd = getattr(agent, "session_cwd", None) or str(resolve_agent_cwd())
+
+        # Fork patch P7 (A10): the HQ approval bridge. When
+        # `codex_app_server.approval_bridge: true` is configured, every
+        # codex-native exec / apply_patch is gated through the HQ hook adapter
+        # (never auto-approved, even under a box-side approvals bypass) and
+        # thread/start pins sandbox + approvalPolicy so codex actually raises an
+        # approval per action. The config -> thread/start + routing + validation
+        # contract is the pure agent.codex_bridge module (kept byte-identical to
+        # hq-agents-v2 provision/codex_bridge.py). When the bridge is off this
+        # whole block is inert and the historical behavior below is preserved.
+        from agent import codex_bridge
+
+        try:
+            from hermes_cli.config import load_config
+
+            _bridge_config = load_config()
+        except Exception:
+            logger.debug(
+                "codex app-server: config load failed; treating bridge as off",
+                exc_info=True,
+            )
+            _bridge_config = {}
+        bridge_on = codex_bridge.bridge_active(_bridge_config)
+        if bridge_on:
+            # Fail closed on an unsafe bridge shape — never fall back to a
+            # permissive app-server session. Mirrors the box-side render guard
+            # so a misconfigured bridge refuses to run rather than bypass the
+            # hook.
+            codex_bridge.validate(_bridge_config)
+
         # Approval callback: defer to Hermes' standard prompt flow if a
         # CLI thread has installed one. Gateway / cron contexts get the
         # codex-side fail-closed default.
@@ -786,6 +922,37 @@ def run_codex_app_server_turn(
                 exc_info=True,
             )
 
+        # Fork patch P7 is a default-OFF, flag-gated patch: the contract
+        # functions (resolve_routing / thread_start_params) fail closed for an
+        # app-server-on-without-bridge config, so they run ONLY when the bridge
+        # is active. When the flag is absent this whole block is inert and the
+        # historical stock behavior below is preserved verbatim (routing mirrors
+        # is_approval_bypass_active(), thread/start stays cwd-only, no adapter
+        # callback). The box-side render guard — not the runtime — is what
+        # refuses an app-server config that lacks the bridge keys.
+        _thread_start_extra: Dict[str, Any] = {}
+        _approval_bridge_callback = None
+        if bridge_on:
+            # Under the bridge, resolve_routing forces both auto-approve flags
+            # OFF regardless of the box's approvals bypass, and thread/start
+            # carries the pinned sandbox + approvalPolicy so codex raises an
+            # approval per action.
+            _routing_flags = codex_bridge.resolve_routing(
+                _bridge_config, approval_bypass_active=auto_approve_requests
+            )
+            _params = codex_bridge.thread_start_params(_bridge_config, cwd=cwd)
+            _thread_start_extra = {
+                k: v for k, v in _params.items() if k != "cwd"
+            }
+            _approval_bridge_callback = _make_codex_approval_bridge_callback(
+                agent, _bridge_config
+            )
+        else:
+            _routing_flags = {
+                "auto_approve_exec": auto_approve_requests,
+                "auto_approve_apply_patch": auto_approve_requests,
+            }
+
         # Bridge codex JSON-RPC notifications (item/started, item/completed,
         # item/agentMessage/delta, ...) into Hermes' gateway UI callbacks
         # (tool_progress_callback, _fire_stream_delta,
@@ -814,12 +981,14 @@ def run_codex_app_server_turn(
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
             approval_callback=approval_callback,
+            approval_bridge_callback=_approval_bridge_callback,
             request_routing=_ServerRequestRouting(
-                auto_approve_exec=auto_approve_requests,
-                auto_approve_apply_patch=auto_approve_requests,
+                auto_approve_exec=_routing_flags["auto_approve_exec"],
+                auto_approve_apply_patch=_routing_flags["auto_approve_apply_patch"],
             ),
             on_event=make_codex_app_server_event_bridge(agent),
             developer_instructions=_developer_instructions,
+            thread_start_params_extra=_thread_start_extra,
         )
 
     # NOTE: the user message is ALREADY appended to messages by the

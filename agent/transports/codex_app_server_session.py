@@ -279,10 +279,12 @@ class CodexAppServerSession:
         codex_home: Optional[str] = None,
         permission_profile: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
+        approval_bridge_callback: Optional[Callable[[dict], str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
         developer_instructions: Optional[str] = None,
+        thread_start_params_extra: Optional[dict[str, Any]] = None,
     ) -> None:
         self._cwd = cwd or os.getcwd()
         # Optional developer message for thread/start (protocol v2). Keeps
@@ -297,7 +299,22 @@ class CodexAppServerSession:
             )
         )
         self._approval_callback = approval_callback
+        # HQ approval bridge (fork patch P7). When set, every codex exec /
+        # apply_patch approval is routed through this callback with a structured
+        # request payload ({"type": "exec"|"apply_patch", ...}) instead of the
+        # interactive ``approval_callback``; it returns a Hermes approval choice
+        # ("once" / "deny") which is mapped to a codex decision. It takes
+        # precedence over ``approval_callback`` and over any auto-approve
+        # routing, so the HQ hook adapter gates every codex-native action. See
+        # agent/codex_bridge.py + codex_runtime.run_codex_app_server_turn.
+        self._approval_bridge_callback = approval_bridge_callback
         self._on_event = on_event  # Display hook (kawaii spinner ticks etc.)
+        # Extra thread/start params merged on top of {"cwd": ...} (fork patch
+        # P7 pins ``sandbox`` + ``approvalPolicy`` here via
+        # agent.codex_bridge.thread_start_params so codex raises an approval
+        # request per shell / apply_patch action). Empty preserves stock
+        # cwd-only behavior.
+        self._thread_start_params_extra = dict(thread_start_params_extra or {})
         self._routing = request_routing or _ServerRequestRouting()
         self._client_factory = client_factory or CodexAppServerClient
 
@@ -312,6 +329,11 @@ class CodexAppServerSession:
         # approval params don't carry the changeset, so we cache here
         # to surface a real summary in the approval prompt (quirk #4).
         self._pending_file_changes: dict[str, str] = {}
+        # Parallel to _pending_file_changes: the raw changed paths per item id,
+        # so the HQ approval bridge can send them as ``approval.paths`` to the
+        # hook adapter (which gates each path). Populated on item/started for
+        # fileChange items, cleared on item/completed.
+        self._pending_file_change_paths: dict[str, list[str]] = {}
         self._closed = False
 
     # ---------- lifecycle ----------
@@ -347,6 +369,14 @@ class CodexAppServerSession:
         # Users who want a write-capable profile configure it in their
         # ~/.codex/config.toml the same way they would for any codex usage.
         params: dict[str, Any] = {"cwd": self._cwd}
+        # Fork patch P7: pin sandbox + approvalPolicy (and any other bridge
+        # thread/start params) so codex raises an approval request per shell /
+        # apply_patch action. Never allowed to clobber cwd. Empty when the
+        # bridge is off (stock cwd-only behavior).
+        for _k, _v in self._thread_start_params_extra.items():
+            if _k == "cwd":
+                continue
+            params[_k] = _v
         if self._developer_instructions:
             # Protocol v2 slot for client-supplied context; codex keeps its
             # own base instructions. Older codex builds that reject the
@@ -1087,14 +1117,33 @@ class CodexAppServerSession:
         gate (mode + ``approvals.timeout``) in ``tools/approval.py``.
         Keep it that way — do not re-read approval config here.
         """
-        if self._routing.auto_approve_exec:
-            return "accept"
         command = params.get("command") or ""
         # Codex's CommandExecutionRequestApprovalParams has cwd as Optional —
         # fall back to the session's cwd when codex doesn't include it so the
         # approval prompt is never empty (quirk #10 fix).
         cwd = params.get("cwd") or self._cwd or "<unknown>"
         reason = params.get("reason")
+        # Fork patch P7: the HQ approval bridge gates EVERY codex exec, even
+        # when a box-side approvals bypass is on — so it deliberately runs
+        # before the auto-approve early return. codex_runtime already forces
+        # auto_approve_exec False whenever this callback is wired, but check the
+        # bridge first regardless so the hook adapter is authoritative.
+        if self._approval_bridge_callback is not None:
+            request = {
+                "type": "exec",
+                "command": params.get("command"),
+                "cwd": cwd,
+            }
+            try:
+                choice = self._approval_bridge_callback(request)
+                return _approval_choice_to_codex_decision(choice)
+            except Exception:
+                logger.exception(
+                    "approval_bridge_callback raised on exec request — denying"
+                )
+                return "decline"  # fail closed
+        if self._routing.auto_approve_exec:
+            return "accept"
         description = f"Codex requests exec in {cwd}"
         if reason:
             description += f" — {reason}"
@@ -1116,6 +1165,26 @@ class CodexAppServerSession:
         resolution is delegated to ``tools/approval.py`` upstream — see
         the docstring on ``_decide_exec_approval``.
         """
+        # Fork patch P7: route apply_patch through the HQ approval bridge with
+        # the concrete changed paths so the hook adapter can gate each one.
+        # Runs before the auto-approve early return for the same reason as
+        # exec — the hook adapter is authoritative even under a box bypass.
+        if self._approval_bridge_callback is not None:
+            item_id = params.get("itemId") or ""
+            paths = self._lookup_pending_file_change_paths(item_id)
+            request = {
+                "type": "apply_patch",
+                "paths": paths,
+                "grantRoot": params.get("grantRoot"),
+            }
+            try:
+                choice = self._approval_bridge_callback(request)
+                return _approval_choice_to_codex_decision(choice)
+            except Exception:
+                logger.exception(
+                    "approval_bridge_callback raised on apply_patch — denying"
+                )
+                return "decline"  # fail closed
         if self._routing.auto_approve_apply_patch:
             return "accept"
         if self._approval_callback is not None:
@@ -1172,6 +1241,7 @@ class CodexAppServerSession:
             changes = item.get("changes") or []
             if not changes:
                 self._pending_file_changes[item_id] = "1 change pending"
+                self._pending_file_change_paths[item_id] = []
                 return
             kinds: dict[str, int] = {}
             paths: list[str] = []
@@ -1190,8 +1260,12 @@ class CodexAppServerSession:
             self._pending_file_changes[item_id] = (
                 f"{counts}: {preview}" if preview else counts
             )
+            # Fork patch P7: cache the raw paths so the approval bridge can
+            # hand each changed path to the HQ hook adapter.
+            self._pending_file_change_paths[item_id] = paths
         elif method == "item/completed":
             self._pending_file_changes.pop(item_id, None)
+            self._pending_file_change_paths.pop(item_id, None)
 
     def _lookup_pending_file_change(self, item_id: str) -> Optional[str]:
         """Look up an in-progress fileChange item by id and summarize its
@@ -1204,6 +1278,15 @@ class CodexAppServerSession:
         if not cached:
             return None
         return cached
+
+    def _lookup_pending_file_change_paths(self, item_id: str) -> list[str]:
+        """Return the cached changed paths for a fileChange item (fork patch
+        P7). Empty when the approval arrived before item/started or the item
+        carried no paths — the HQ hook adapter treats an empty path list as a
+        malformed apply_patch request and denies (fail closed)."""
+        if not item_id:
+            return []
+        return list(self._pending_file_change_paths.get(item_id) or [])
 
 
 def _apply_token_usage_notification(result: TurnResult, note: dict) -> None:

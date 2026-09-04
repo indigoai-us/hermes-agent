@@ -10918,8 +10918,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             reply_anchor = self._reply_anchor_for_event(event)
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
-            if self._queue_during_drain_enabled(effective_mode):
+            queued_during_drain = self._queue_during_drain_enabled(effective_mode)
+            if queued_during_drain:
                 self._queue_or_replace_pending_event(session_key, event)
+            # Fork patch P9: master lifecycle-broadcast gate. When disabled,
+            # the runtime stays silent on drain instead of replying with a
+            # robotic "⏳ Gateway shutting down" banner — the event is still
+            # queued above and answered after the gateway comes back.
+            if not getattr(self.config, "lifecycle_broadcasts_enabled", True):
+                return True
+            if queued_during_drain:
                 message = hq_branding.busy_notice(self._restart_requested, queued=True)
             else:
                 message = hq_branding.busy_notice(self._restart_requested)
@@ -11449,6 +11457,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if not job_ids:
             return 0
+        # Fork patch P9: master lifecycle-broadcast gate. When disabled the
+        # runtime never pushes system-generated lifecycle notices to a
+        # platform; interrupted-cron notices stay in logs only.
+        if not getattr(self.config, "lifecycle_broadcasts_enabled", True):
+            logger.info(
+                "Cron interrupt notices suppressed: lifecycle_broadcasts_enabled=false"
+            )
+            return 0
         try:
             from cron.jobs import get_job
             from cron.scheduler import _resolve_delivery_targets
@@ -11529,6 +11545,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         messages can be delivered. Best-effort: individual send failures are
         logged and swallowed so they never block the shutdown sequence.
         """
+        # Fork patch P9: master lifecycle-broadcast gate. When disabled the
+        # runtime stays silent on shutdown/restart — no "⚠️ Gateway shutting
+        # down" banner reaches any active session's channel or thread.
+        if not getattr(self.config, "lifecycle_broadcasts_enabled", True):
+            logger.info(
+                "Shutdown/restart session notices suppressed: "
+                "lifecycle_broadcasts_enabled=false"
+            )
+            return
         active = self._snapshot_running_agents()
         restart_source = self._restart_command_source if self._restart_requested else None
 
@@ -18768,6 +18793,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 if queue_during_drain:
                     self._queue_or_replace_pending_event(_quick_key, event)
+                # Fork patch P9: stay silent on drain when lifecycle
+                # broadcasts are disabled; the event is queued above.
+                if not getattr(self.config, "lifecycle_broadcasts_enabled", True):
+                    return None
                 return hq_branding.busy_notice(
                     self._restart_requested, queued=queue_during_drain
                 )
@@ -19331,6 +19360,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._handle_voice_command(event)
 
         if self._draining:
+            # Fork patch P9: stay silent on drain when lifecycle broadcasts
+            # are disabled instead of returning a robotic banner.
+            if not getattr(self.config, "lifecycle_broadcasts_enabled", True):
+                return None
             return hq_branding.busy_notice(self._restart_requested, new_work=True)
 
         # User-defined quick commands (bypass agent loop, no LLM call)
@@ -26219,6 +26252,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         notify_path = _hermes_home / ".restart_notify.json"
         if not notify_path.exists():
             return None
+        # Fork patch P9: master lifecycle-broadcast gate. When disabled, the
+        # post-restart "gateway restarted successfully" reply is suppressed;
+        # clear the marker so it cannot leak on a later flag flip.
+        if not getattr(self.config, "lifecycle_broadcasts_enabled", True):
+            logger.info(
+                "Restart notification suppressed: lifecycle_broadcasts_enabled=false"
+            )
+            notify_path.unlink(missing_ok=True)
+            return None
 
         try:
             data = json.loads(notify_path.read_text(encoding="utf-8"))
@@ -26306,6 +26348,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         delivered: set[tuple[str, str, Optional[str]]] = set()
         skipped = skip_targets or set()
+        # Fork patch P9: master lifecycle-broadcast gate. When disabled the
+        # runtime posts no home-channel "gateway online" startup banner.
+        if not getattr(self.config, "lifecycle_broadcasts_enabled", True):
+            logger.info(
+                "Home-channel startup notices suppressed: "
+                "lifecycle_broadcasts_enabled=false"
+            )
+            return delivered
         message = hq_branding.back_online_notice()
 
         for platform, platform_cfg in self.config.platforms.items():

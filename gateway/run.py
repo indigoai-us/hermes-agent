@@ -1056,6 +1056,30 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     return text
 
 
+def _format_iteration_progress(iteration: Any, max_iter: Any) -> str:
+    """Render ``iteration N``, appending ``/MAX`` only when a real cap is set.
+
+    ``AIAgent.max_iterations`` defaults to ``sys.maxsize`` (INT64_MAX,
+    9223372036854775807) meaning "no real cap" (see ``agent/agent_init.py``).
+    Rendering that as a denominator leaks an ugly ``iteration 13/9223372036854775807``
+    into chat (live-smoke 2026-09-05). Omit the denominator entirely when there
+    is no meaningful iteration limit.
+    """
+    try:
+        it = int(iteration)
+    except (TypeError, ValueError):
+        return ""
+    mi: Optional[int] = None
+    if max_iter is not None:
+        try:
+            _mi = int(max_iter)
+            if 0 < _mi < sys.maxsize:
+                mi = _mi
+        except (TypeError, ValueError):
+            mi = None
+    return f"iteration {it}/{mi}" if mi is not None else f"iteration {it}"
+
+
 def render_notice_line(notice) -> str:
     """Render an AgentNotice to a single plaintext line for messaging platforms.
 
@@ -11254,8 +11278,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     elapsed_min = int((now - start_ts) / 60)
                     if elapsed_min > 0:
                         status_parts.append(f"{elapsed_min} min elapsed")
-                if max_iter:
-                    status_parts.append(f"iteration {iteration}/{max_iter}")
+                _iter_progress = _format_iteration_progress(iteration, max_iter)
+                if _iter_progress:
+                    status_parts.append(_iter_progress)
                 if current_tool:
                     status_parts.append(f"running: {current_tool}")
             except Exception:
@@ -11829,6 +11854,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         user sent ``/new`` and a fresh agent took the slot mid-run, #12029).
         """
         if agent is None:
+            return False
+        # P9 lifecycle gate: the "⏳ Working — N min" heartbeat is unprompted,
+        # system-generated runtime chatter — the same class as shutdown/startup
+        # lifecycle banners (policy
+        # ``indigo-fleet-agents-never-broadcast-runtime-lifecycle-messages``).
+        # HQ boxes render ``lifecycle_broadcasts_enabled`` false, so no progress
+        # / "still working" notice may reach a chat platform at all. If liveness
+        # must be shown, an adapter's typing indicator is the only allowed
+        # surface (live-smoke 2026-09-05). No text heartbeat here.
+        _cfg = getattr(self, "config", None)
+        if _cfg is not None and not getattr(
+            _cfg, "lifecycle_broadcasts_enabled", True
+        ):
             return False
         if executor_task is not None and executor_task.done():
             return False
@@ -31014,9 +31052,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _a = _agent_ref.get_activity_summary()
                         _parts = []
                         if _want_iteration_detail:
-                            _parts.append(
-                                f"iteration {_a['api_call_count']}/{_a['max_iterations']}"
+                            _iter_progress = _format_iteration_progress(
+                                _a.get("api_call_count", 0),
+                                _a.get("max_iterations"),
                             )
+                            if _iter_progress:
+                                _parts.append(_iter_progress)
                         _action = _a.get("current_tool") or _a.get("last_activity_desc")
                         if _action:
                             _parts.append(str(_action))
@@ -31364,6 +31405,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _timeout_mins = int(_agent_timeout // 60) or 1
 
                 # Construct a user-facing message with diagnostic context.
+                _iter_progress = _format_iteration_progress(_iter_n, _iter_max)
                 _diag_lines = [
                     f"⏱️ Agent inactive for {_timeout_mins} min — no tool calls "
                     f"or API responses."
@@ -31372,12 +31414,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _diag_lines.append(
                         f"The agent appears stuck on tool `{_cur_tool}` "
                         f"({_secs_ago:.0f}s since last activity, "
-                        f"iteration {_iter_n}/{_iter_max})."
+                        f"{_iter_progress})."
                     )
                 else:
                     _diag_lines.append(
                         f"Last activity: {_last_desc} ({_secs_ago:.0f}s ago, "
-                        f"iteration {_iter_n}/{_iter_max}). "
+                        f"{_iter_progress}). "
                         "The agent may have been waiting on an API response."
                     )
                 _diag_lines.append(

@@ -17,6 +17,7 @@ Two kinds of coverage:
     free-floating robotic lifecycle banner elsewhere without failing a test.
 """
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -174,3 +175,65 @@ def test_incident_phrase_exists_in_branding_module():
     """Guard the tripwire itself: if branding is refactored so the phrase moves
     or vanishes, this fails loudly rather than passing vacuously."""
     assert _files_containing("Your current task will be interrupted") == {_BRANDING}
+
+
+# ── P9 extension: progress / "still working" heartbeat is lifecycle chatter ──
+#
+# The "⏳ Working — N min" long-running heartbeat is unprompted, system-generated
+# runtime chatter of the same class as the shutdown/startup banners. HQ boxes set
+# ``lifecycle_broadcasts_enabled=False``, so the heartbeat gate
+# (``_should_emit_long_running_notification``) must refuse to emit — no progress
+# notice reaches a chat platform (live-smoke 2026-09-05, webclient DM leak of
+# "⏳ Working, 3 min, iteration 13/9223372036854775807, receiving stream response").
+
+
+def test_progress_heartbeat_suppressed_for_hq_boxes():
+    """With the master lifecycle gate off, the long-running progress heartbeat
+    must not emit even while the run legitimately owns its session slot."""
+    runner, _adapter = make_restart_runner()
+    runner.config.lifecycle_broadcasts_enabled = False
+    runner._peek_session_state = lambda _key: None
+
+    agent = object()
+    should_emit = gateway_run.GatewayRunner._should_emit_long_running_notification(
+        runner, session_key=None, agent=agent, executor_task=None
+    )
+    assert should_emit is False
+
+
+def test_progress_heartbeat_emits_by_default():
+    """Default (stock upstream) behavior keeps the heartbeat so the gate cannot
+    silently become always-off."""
+    runner, _adapter = make_restart_runner()
+    runner.config.lifecycle_broadcasts_enabled = True
+    runner._peek_session_state = lambda _key: None
+
+    agent = object()
+    should_emit = gateway_run.GatewayRunner._should_emit_long_running_notification(
+        runner, session_key=None, agent=agent, executor_task=None
+    )
+    assert should_emit is True
+
+
+# ── iteration denominator: omit when max_iterations is unset (INT64_MAX) ──────
+
+
+def test_iteration_denominator_omitted_when_max_unset():
+    """``AIAgent.max_iterations`` defaults to ``sys.maxsize`` (no real cap).
+    The denominator must be omitted rather than leaking 9223372036854775807."""
+    assert gateway_run._format_iteration_progress(13, sys.maxsize) == "iteration 13"
+    # None and non-positive sentinels are also "no cap".
+    assert gateway_run._format_iteration_progress(13, None) == "iteration 13"
+    assert gateway_run._format_iteration_progress(13, 0) == "iteration 13"
+    assert gateway_run._format_iteration_progress(13, -1) == "iteration 13"
+
+
+def test_iteration_denominator_shown_when_real_cap_set():
+    """A genuine cap still renders the denominator."""
+    assert gateway_run._format_iteration_progress(3, 40) == "iteration 3/40"
+
+
+def test_iteration_progress_survives_bad_inputs():
+    assert gateway_run._format_iteration_progress(None, 40) == ""
+    assert gateway_run._format_iteration_progress("x", 40) == ""
+    assert gateway_run._format_iteration_progress(5, "nan") == "iteration 5"

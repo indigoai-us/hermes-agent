@@ -112,6 +112,31 @@ def _extract_nick(prefix: str) -> str:
     return prefix.split("!")[0] if "!" in prefix else prefix
 
 
+def _lifecycle_broadcasts_enabled() -> bool:
+    """Fork patch P9: honor ``gateway.lifecycle_broadcasts_enabled`` for the
+    IRC QUIT reason.
+
+    The QUIT reason sent on disconnect ("Hermes Agent shutting down") is a
+    human-facing, system-generated lifecycle string — the same class of
+    unprompted runtime notice the P9 master gate silences for HQ fleet boxes so
+    an agent never pushes robotic lifecycle boilerplate at a customer-facing
+    channel/server. It lands at the IRC protocol layer (not through the runner's
+    broadcast paths that run.py already gates), so it was left ungated. When the
+    gate is off we send a bare ``QUIT`` (no reason) instead.
+
+    Defaults to True (stock upstream behavior) on any config problem, matching
+    the dataclass default and the gates in gateway/run.py.
+    """
+    try:
+        from gateway.config import load_gateway_config
+
+        return bool(
+            getattr(load_gateway_config(), "lifecycle_broadcasts_enabled", True)
+        )
+    except Exception:
+        return True
+
+
 # ---------------------------------------------------------------------------
 # IRC Adapter
 # ---------------------------------------------------------------------------
@@ -257,7 +282,14 @@ class IRCAdapter(BasePlatformAdapter):
         self._mark_disconnected()
         if self._writer and not self._writer.is_closing():
             try:
-                await self._send_raw("QUIT :Hermes Agent shutting down")
+                # P9: the QUIT reason is a human-facing lifecycle string. Send it
+                # only when lifecycle broadcasts are enabled (stock upstream);
+                # otherwise send a bare QUIT so no branded lifecycle text reaches
+                # the IRC server/channel.
+                if _lifecycle_broadcasts_enabled():
+                    await self._send_raw("QUIT :Hermes Agent shutting down")
+                else:
+                    await self._send_raw("QUIT")
                 await asyncio.sleep(0.5)
             except Exception:
                 pass

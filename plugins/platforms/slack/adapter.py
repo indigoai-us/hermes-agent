@@ -17,6 +17,7 @@ import os
 import re
 import time
 import unicodedata
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, ClassVar, Dict, Optional, Any, Tuple, List
 
@@ -1243,6 +1244,19 @@ class SlackAdapter(BasePlatformAdapter):
         # respond to ALL subsequent messages in that thread automatically.
         self._mentioned_threads: set[str] = set()
         self._MENTIONED_THREADS_MAX = 5000
+        # Fork patch P12 (hq/v2): persisted Slack thread-follow. The two sets
+        # above (_bot_message_ts, _mentioned_threads) are in-memory only and are
+        # wiped on every gateway restart, so an un-mentioned follow-up in a
+        # thread the bot has already replied in can be silently dropped after a
+        # restart (or an in-memory miss). When ``thread_follow_replies`` is on
+        # we ALSO record — in a bounded LRU persisted under HERMES_HOME — every
+        # thread the bot has replied in, and treat un-mentioned replies there as
+        # addressed. Keys are stored in BOTH scoped ("team:ts") and bare ("ts")
+        # form so a team-id resolution asymmetry between the send path and the
+        # wake path can never silence the bot. Default off ⇒ stock behaviour.
+        self._followed_threads: "OrderedDict[str, float]" = OrderedDict()
+        self._FOLLOWED_THREADS_MAX = 5000
+        self._load_followed_threads()
         # Assistant thread metadata keyed by (team_id, channel_id, thread_ts).
         # Slack's AI Assistant lifecycle events can arrive before/alongside
         # message events, and carry identity needed for stable session scoping.
@@ -1600,6 +1614,104 @@ class SlackAdapter(BasePlatformAdapter):
             return
         self._discard_oldest_slack_timestamps(
             self._mentioned_threads, self._MENTIONED_THREADS_MAX // 2
+        )
+
+    # ── Fork patch P12 (hq/v2): persisted Slack thread-follow ────────────────
+    @staticmethod
+    def _thread_follow_key(team_id: str, thread_ts: str) -> str:
+        """Canonical string key for the followed-threads LRU (JSON-safe).
+
+        Scoped as ``"{team}:{thread_ts}"`` when a team id is known, else the
+        bare ``thread_ts``. thread ts values are Slack floats ("172…​.001") and
+        team ids are ``T…`` — neither contains ``:`` — so the join is
+        unambiguous.
+        """
+        t = str(thread_ts or "")
+        return f"{str(team_id)}:{t}" if team_id else t
+
+    def _followed_threads_path(self) -> Optional[_Path]:
+        """State file for the persisted followed-threads LRU, or None.
+
+        Uses HERMES_HOME (the same state dir the adapter already writes
+        slack_tokens.json / slack-manifest.json to), so the set survives
+        gateway restarts. Best-effort: any failure disables persistence but
+        leaves the in-memory LRU working.
+        """
+        try:
+            from hermes_constants import get_hermes_home
+
+            return _Path(get_hermes_home()) / "slack_followed_threads.json"
+        except Exception:
+            return None
+
+    def _load_followed_threads(self) -> None:
+        """Load the persisted followed-threads LRU on adapter init (best-effort)."""
+        path = self._followed_threads_path()
+        if not path:
+            return
+        try:
+            if not path.exists():
+                return
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                # Oldest-first list; preserve order into the LRU.
+                for key in data[-self._FOLLOWED_THREADS_MAX :]:
+                    if isinstance(key, str) and key:
+                        self._followed_threads[key] = 0.0
+        except Exception:
+            logger.debug("[Slack] Failed to load followed-threads LRU", exc_info=True)
+
+    def _persist_followed_threads(self) -> None:
+        """Persist the followed-threads LRU (best-effort, oldest-first)."""
+        path = self._followed_threads_path()
+        if not path:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = json.dumps(
+                list(self._followed_threads.keys()), ensure_ascii=False
+            )
+            # Atomic replace: write a sibling temp file then os.replace so a
+            # crash mid-write never leaves a torn/partial JSON file that the
+            # next load would discard (same-dir rename is atomic on POSIX).
+            tmp = path.parent / f"{path.name}.tmp-{os.getpid()}"
+            try:
+                tmp.write_text(payload, encoding="utf-8")
+                os.replace(tmp, path)
+            finally:
+                try:
+                    tmp.unlink()
+                except FileNotFoundError:
+                    pass
+        except Exception:
+            logger.debug("[Slack] Failed to persist followed-threads LRU", exc_info=True)
+
+    def _record_followed_thread(self, team_id: str, thread_ts: str) -> None:
+        """Record a thread the bot has replied in (gated on thread_follow_replies).
+
+        Stores both the scoped and bare key so the wake lookup matches
+        regardless of whether the team id was known at record vs wake time.
+        Bounds the LRU and persists so the record survives restarts.
+        """
+        if not thread_ts or not self._slack_thread_follow_replies():
+            return
+        keys = {self._thread_follow_key(team_id, thread_ts), str(thread_ts)}
+        for key in keys:
+            if not key:
+                continue
+            self._followed_threads[key] = time.time()
+            self._followed_threads.move_to_end(key)
+        while len(self._followed_threads) > self._FOLLOWED_THREADS_MAX:
+            self._followed_threads.popitem(last=False)
+        self._persist_followed_threads()
+
+    def _is_followed_thread(self, team_id: str, thread_ts: str) -> bool:
+        """True if the bot has recorded a reply in this thread (P12)."""
+        if not thread_ts:
+            return False
+        return (
+            self._thread_follow_key(team_id, thread_ts) in self._followed_threads
+            or str(thread_ts) in self._followed_threads
         )
 
     @staticmethod
@@ -3332,6 +3444,8 @@ class SlackAdapter(BasePlatformAdapter):
                     self._bot_message_ts.add(
                         self._workspace_message_marker(team_id, thread_ts)
                     )
+                    # Fork patch P12: durably record this thread as bot-followed.
+                    self._record_followed_thread(team_id, thread_ts)
                 self._trim_bot_message_timestamps()
 
             return SendResult(
@@ -4357,6 +4471,8 @@ class SlackAdapter(BasePlatformAdapter):
         self._bot_message_ts.add(
             self._workspace_message_marker(team_id, thread_ts)
         )
+        # Fork patch P12: durably record this thread as bot-followed.
+        self._record_followed_thread(team_id, thread_ts)
         self._trim_bot_message_timestamps()
 
     def _is_retryable_upload_error(self, exc: Exception) -> bool:
@@ -6200,6 +6316,16 @@ class SlackAdapter(BasePlatformAdapter):
         """
         if not event_thread_ts:
             return False
+        # Fork patch P12 (hq/v2): persisted thread-follow. A thread the bot has
+        # replied in (recorded to a bounded LRU under HERMES_HOME) is addressed
+        # on un-mentioned follow-ups even across a gateway restart — the
+        # durable analogue of the in-memory _bot_message_ts / _mentioned_threads
+        # checks below. Gated off by default; strict/thread_require_mention
+        # (checked upstream in _handle_slack_message_impl) still force a
+        # re-mention before this path is reached.
+        if is_thread_reply and self._slack_thread_follow_replies():
+            if self._is_followed_thread(team_id, event_thread_ts):
+                return True
         thread_marker = self._workspace_message_marker(team_id, event_thread_ts)
         # Check both the workspace-scoped marker and the bare ts: entries
         # recorded before a team id was learned (or by legacy paths) are bare
@@ -9344,6 +9470,30 @@ class SlackAdapter(BasePlatformAdapter):
                 return configured.lower() in {"true", "1", "yes", "on"}
             return bool(configured)
         return os.getenv("SLACK_STRICT_MENTION", "false").lower() in {
+            "true",
+            "1",
+            "yes",
+            "on",
+        }
+
+    def _slack_thread_follow_replies(self) -> bool:
+        """Fork patch P12 (hq/v2): persist threads the bot has replied in and
+        treat un-mentioned replies there as addressed (survives restart).
+
+        Narrower than the in-memory ``_bot_message_ts`` / ``_mentioned_threads``
+        auto-follow: those are lost on every restart, so an un-mentioned
+        follow-up in a thread the bot answered before the restart is dropped.
+        When this is on the follow set is persisted under HERMES_HOME. Still
+        gated by ``strict_mention`` / ``thread_require_mention`` upstream (those
+        force a re-mention for every thread turn and take precedence). Defaults
+        to False so a dropped patch on a pin bump reverts to stock behaviour.
+        """
+        configured = self.config.extra.get("thread_follow_replies")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() in {"true", "1", "yes", "on"}
+            return bool(configured)
+        return os.getenv("SLACK_THREAD_FOLLOW_REPLIES", "false").lower() in {
             "true",
             "1",
             "yes",

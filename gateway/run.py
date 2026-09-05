@@ -902,6 +902,34 @@ def _format_exec_approval_fallback(
     if smart_denied:
         heading = "⚠️ **Smart DENY — owner override for one operation:**"
 
+    # Fork patch P14: on HQ boxes the ask reads as a person — a plain line
+    # saying what the agent needs and why, the raw command folded into a
+    # trailing "details:" block (never the body), no robotic banner. Default
+    # off ⇒ the stock text below runs byte-identically.
+    try:
+        from agent import hq_branding
+
+        if hq_branding.approval_voice_enabled():
+            intent = hq_branding.summarize_command_intent(command, description)
+            ask = hq_branding.approval_ask_text(None, intent)
+            choices = [f"Reply `{command_prefix}approve` to go ahead"]
+            if not smart_denied and allow_session:
+                choices.append(
+                    f"`{command_prefix}approve session` to allow this for the session"
+                )
+                if allow_permanent:
+                    choices.append(
+                        f"`{command_prefix}approve always` to allow it from now on"
+                    )
+            choices.append(f"`{command_prefix}deny` to skip it")
+            return (
+                f"{ask}\n\n"
+                + ", ".join(choices[:-1]) + f", or {choices[-1]}.\n\n"
+                + hq_branding.approval_details_block(cmd_preview)
+            )
+    except Exception:
+        pass
+
     choices = [f"Reply `{command_prefix}approve` to execute this one operation"]
     if not smart_denied and allow_session:
         choices.append(

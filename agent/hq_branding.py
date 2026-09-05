@@ -166,6 +166,106 @@ def _enabled_from_loaded_config() -> bool:
     return is_truthy_value(_agent_cfg(None).get("hq_branding", False), default=False)
 
 
+# ── Fork patch P14 (hq/v2): approval voice ───────────────────────────────────
+# The runtime's command-approval prompt reads as a person, not a machine. When
+# ``gateway.approval_voice_enabled`` is on (HQ boxes render it true; default off
+# reproduces the stock ":warning: Command Approval Required" banner), an approval
+# ask is one or two plain lines addressed to the requester describing what the
+# agent needs to do and why. The raw command never appears in the message body —
+# it goes behind a fold / thread-reply "details:" block. The confirmation drops
+# the robotic ":white_check_mark: Approved for session by <handle>"; on deny/
+# timeout the agent says it is skipping the step, in voice. All of the
+# user-facing approval copy lives here so a later change cannot re-introduce a
+# robotic banner elsewhere (source tripwire in tests/agent/test_hq_branding.py).
+
+APPROVAL_DETAILS_PREFIX = "details:"
+
+
+def approval_voice_enabled(config: Optional[dict[str, Any]] = None) -> bool:
+    """Fork patch P14: honor ``gateway.approval_voice_enabled``.
+
+    Default False reproduces stock upstream approval prompts. HQ boxes render it
+    true via the hq-agents-v2 config template. A config-load failure fails
+    closed to False (stock) so a broken config never silently changes wording.
+    """
+    if config is not None and isinstance(config, dict):
+        gw = config.get("gateway") if isinstance(config.get("gateway"), dict) else {}
+        if "approval_voice_enabled" in config:
+            return is_truthy_value(config.get("approval_voice_enabled"), default=False)
+        if isinstance(gw, dict) and "approval_voice_enabled" in gw:
+            return is_truthy_value(gw.get("approval_voice_enabled"), default=False)
+        return False
+    try:
+        from gateway.config import load_gateway_config
+
+        return bool(getattr(load_gateway_config(), "approval_voice_enabled", False))
+    except Exception:
+        return False
+
+
+def summarize_command_intent(command: str, description: str = "") -> str:
+    """Paraphrase a pending action into a short human phrase.
+
+    The raw command is never surfaced; this classifies the command so the ask
+    reads like a person ("read my instance details", "list some files on my
+    box", "call the AWS API"). Falls back to a redacted-free description or a
+    generic phrase. Used only to build the ask body, never to display the
+    command.
+    """
+    cmd = (command or "").strip()
+    low = cmd.lower()
+    if not cmd:
+        desc = (description or "").strip()
+        return desc or "run a quick command on my box"
+    # Cloud instance metadata (the 2026-09-04 EC2-cost case).
+    if "169.254.169.254" in low or "meta-data" in low or "instance-id" in low:
+        return "read my instance details"
+    # AWS API / cloud control-plane calls.
+    if low.startswith("aws ") or "amazonaws.com" in low or " aws " in f" {low} ":
+        return "call the AWS API"
+    # Directory listings.
+    if low.startswith("ls ") or low == "ls" or low.startswith("find "):
+        return "list some files on my box"
+    # Reads.
+    if low.startswith(("cat ", "head ", "tail ", "less ", "grep ")):
+        return "read a file on my box"
+    # Git.
+    if low.startswith("git "):
+        return "run a git command"
+    # HTTP fetch.
+    if low.startswith(("curl ", "wget ", "http ")):
+        return "make a network request from my box"
+    desc = (description or "").strip()
+    if desc and desc.lower() not in ("dangerous command",):
+        return desc
+    return "run a quick command on my box"
+
+
+def approval_ask_text(requester_name: Optional[str], intent: str) -> str:
+    """One human line asking the requester for the OK to run a pending action."""
+    intent = (intent or "run a quick command on my box").strip()
+    name = (requester_name or "").strip()
+    if name:
+        return f"{name}, to answer that I need to {intent}. OK to go ahead?"
+    return f"To answer that I need to {intent}. OK to go ahead?"
+
+
+def approval_details_block(command: str) -> str:
+    """The raw (already-redacted) command, folded behind a details reply."""
+    cmd = (command or "").strip()
+    return f"{APPROVAL_DETAILS_PREFIX}\n```\n{cmd}\n```"
+
+
+def approval_confirmation_text() -> str:
+    """Plain in-voice confirmation shown after an approval (never a handle)."""
+    return "Thanks, running it."
+
+
+def approval_denied_text() -> str:
+    """In-voice line when the approval is denied or times out."""
+    return "Skipping that check since I didn't get an OK; here's what I can say without it."
+
+
 def _agent_cfg(config: Optional[dict[str, Any]]) -> dict[str, Any]:
     if config is None:
         try:
@@ -179,6 +279,7 @@ def _agent_cfg(config: Optional[dict[str, Any]]) -> dict[str, Any]:
 
 
 __all__ = [
+    "APPROVAL_DETAILS_PREFIX",
     "DISPLAY_NAME_ENV",
     "HQ_IDENTITY_FALLBACK",
     "HQ_IDENTITY_LEAD",
@@ -186,6 +287,12 @@ __all__ = [
     "FALLBACK_AGENT_NAME",
     "STOCK_AGENT_NAME",
     "agent_name",
+    "approval_ask_text",
+    "approval_confirmation_text",
+    "approval_denied_text",
+    "approval_details_block",
+    "approval_voice_enabled",
+    "summarize_command_intent",
     "back_online_notice",
     "busy_notice",
     "cron_interrupt_notice",

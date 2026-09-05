@@ -4395,6 +4395,188 @@ class TestThreadContextAppMessages:
         assert "deploy #42 succeeded" in content
 
 
+class TestSlackThreadRichShares:
+    """Fork patch P10 — shared/forwarded message ``message_blocks`` mining.
+
+    A message shared into a thread nests its Block Kit body under
+    ``attachments[].message_blocks[].message.blocks`` (distinct from the
+    attachment-level ``blocks``). When the share carries NO ``text``/``fallback``
+    its body is otherwise blank in the transcript — the same class of blindness
+    #3111 fixed for the top-level ``.text`` case. The mining is gated on
+    ``platforms.slack.extra.thread_context_rich_shares`` (default off ⇒ stock).
+    """
+
+    @staticmethod
+    def _make_replies(messages):
+        return AsyncMock(return_value={"messages": messages})
+
+    @staticmethod
+    def _shared_message_blocks(text):
+        return [
+            {
+                "team": "T1",
+                "channel": "C_SRC",
+                "ts": "90.0",
+                "message": {
+                    "blocks": _rich_text_blocks(
+                        _rich_text_section({"type": "text", "text": text})
+                    )
+                },
+            }
+        ]
+
+    def test_render_message_text_flag_off_drops_message_blocks(self, adapter):
+        """Default (flag off): a message_blocks-only share renders blank —
+        stock behaviour is byte-for-byte unchanged."""
+        msg = {
+            "text": "",
+            "attachments": [
+                {
+                    "author_name": "Bogey Bros",
+                    "is_share": True,
+                    "message_blocks": self._shared_message_blocks(
+                        "hey guys Max never checks in after first sync"
+                    ),
+                }
+            ],
+        }
+        assert adapter._render_message_text(msg) == ""
+        assert adapter._render_message_text(msg, rich_shares=False) == ""
+
+    def test_render_message_text_flag_on_surfaces_message_blocks(self, adapter):
+        """Flag on: the shared body is recovered."""
+        msg = {
+            "text": "",
+            "attachments": [
+                {
+                    "author_name": "Bogey Bros",
+                    "is_share": True,
+                    "message_blocks": self._shared_message_blocks(
+                        "hey guys Max never checks in after first sync"
+                    ),
+                }
+            ],
+        }
+        rendered = adapter._render_message_text(msg, rich_shares=True)
+        assert "Max never checks in after first sync" in rendered
+
+    def test_message_blocks_not_double_counted_when_text_present(self, adapter):
+        """A share that ALSO carries top-level text must not duplicate it."""
+        body = "hey guys Max never checks in after first sync"
+        msg = {
+            "text": "",
+            "attachments": [
+                {
+                    "text": body,
+                    "message_blocks": self._shared_message_blocks(body),
+                }
+            ],
+        }
+        rendered = adapter._render_message_text(msg, rich_shares=True)
+        assert rendered.count("Max never checks in") == 1
+
+    def test_flag_reads_config_extra(self):
+        from plugins.platforms.slack.adapter import SlackAdapter
+
+        off = SlackAdapter(PlatformConfig(enabled=True, token="***"))
+        assert off._thread_rich_shares_enabled() is False
+        on = SlackAdapter(
+            PlatformConfig(
+                enabled=True,
+                token="***",
+                extra={"thread_context_rich_shares": True},
+            )
+        )
+        assert on._thread_rich_shares_enabled() is True
+
+    @pytest.mark.asyncio
+    async def test_transcript_shared_message_plus_file_two_speakers(self, adapter):
+        """End-to-end transcript: two speakers, a shared message (message_blocks
+        only), and a file — the golden case for the review's §1a attachment loop.
+        With the flag on, the shared body renders and the file marker appears."""
+        adapter._thread_context_cache.clear()
+        adapter.config.extra = {"thread_context_rich_shares": True}
+        adapter.set_authorization_check(
+            lambda user_id, chat_type=None, chat_id=None: True
+        )
+        messages = [
+            {"ts": "100.0", "user": "U_JACOB", "text": "relaying the Bogey Bros ask"},
+            {
+                "ts": "101.0",
+                "user": "U_JACOB",
+                "text": "",
+                "attachments": [
+                    {
+                        "author_name": "Bogey Bros",
+                        "is_share": True,
+                        "message_blocks": self._shared_message_blocks(
+                            "hey guys Max never checks in after first sync"
+                        ),
+                    }
+                ],
+            },
+            {
+                "ts": "102.0",
+                "user": "U_STEFAN",
+                "text": "look at the logs",
+                "files": [{"name": "max.log", "mimetype": "text/plain"}],
+            },
+        ]
+        adapter._app.client.conversations_replies = self._make_replies(messages)
+        names = {"U_JACOB": "Jacob Posel", "U_STEFAN": "Stefan Johnson"}
+
+        with patch.object(
+            adapter, "_resolve_user_name",
+            new=AsyncMock(side_effect=lambda uid, **_: names.get(uid, uid)),
+        ):
+            content = await adapter._fetch_thread_context(
+                channel_id="C1", thread_ts="100.0", current_ts="999.0",
+            )
+
+        # Both speakers, by resolved display name.
+        assert "[thread parent] Jacob Posel: relaying the Bogey Bros ask" in content
+        assert "Stefan Johnson: look at the logs" in content
+        # The shared message's body (message_blocks only) is no longer blank.
+        assert "Max never checks in after first sync" in content
+        # The file is surfaced as a marker.
+        assert "[file: max.log (text/plain)]" in content
+
+    @pytest.mark.asyncio
+    async def test_transcript_shared_message_blank_when_flag_off(self, adapter):
+        """Flag off: the message_blocks-only share collapses (dropped) — the
+        pre-P10 (stock) behaviour, proving the patch is inert by default."""
+        adapter._thread_context_cache.clear()
+        adapter.config.extra = {}
+        adapter.set_authorization_check(
+            lambda user_id, chat_type=None, chat_id=None: True
+        )
+        messages = [
+            {"ts": "100.0", "user": "U_JACOB", "text": "relaying the ask"},
+            {
+                "ts": "101.0",
+                "user": "U_JACOB",
+                "text": "",
+                "attachments": [
+                    {
+                        "is_share": True,
+                        "message_blocks": self._shared_message_blocks(
+                            "hey guys Max never checks in after first sync"
+                        ),
+                    }
+                ],
+            },
+        ]
+        adapter._app.client.conversations_replies = self._make_replies(messages)
+        with patch.object(
+            adapter, "_resolve_user_name",
+            new=AsyncMock(side_effect=lambda uid, **_: uid),
+        ):
+            content = await adapter._fetch_thread_context(
+                channel_id="C1", thread_ts="100.0", current_ts="999.0",
+            )
+        assert "Max never checks in" not in content
+
+
 # ---------------------------------------------------------------------------
 # Missing-credential handling — fatal-error contract
 # ---------------------------------------------------------------------------

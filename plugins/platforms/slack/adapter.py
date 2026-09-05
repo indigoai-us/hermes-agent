@@ -595,7 +595,9 @@ def _extract_text_from_slack_blocks(blocks: list) -> str:
     return "\n".join(parts)
 
 
-def _extract_text_from_slack_attachments(attachments: list) -> str:
+def _extract_text_from_slack_attachments(
+    attachments: list, include_message_blocks: bool = False
+) -> str:
     """Extract readable text from legacy Slack message ``attachments``.
 
     Apps such as Alertmanager, Grafana, PagerDuty, and CI bots post messages
@@ -608,6 +610,17 @@ def _extract_text_from_slack_attachments(attachments: list) -> str:
     Prefers structured fields (``pretext``/``title``/``text``/``fields``) and
     only falls back to an attachment's ``fallback`` string when it carries
     nothing else.
+
+    ``include_message_blocks`` (fork patch P10, off by default so stock
+    behaviour is unchanged when the flag is dropped on a pin bump) additionally
+    mines a *shared/forwarded* message's rich Block Kit body, which Slack nests
+    under ``attachments[].message_blocks[].message.blocks`` — a different key
+    from the attachment-level ``blocks`` handled above. A message shared into a
+    thread almost always also carries ``text``/``fallback`` (captured without
+    the flag); this recovers the rare share whose body lives ONLY in
+    ``message_blocks`` (e.g. a Block-Kit-only bot post forwarded in), which
+    otherwise renders blank — the same class of blindness #3111 fixed for the
+    top-level ``.text`` case.
     """
     if not attachments:
         return ""
@@ -632,6 +645,23 @@ def _extract_text_from_slack_attachments(attachments: list) -> str:
             block_text = _extract_text_from_slack_blocks(nested)
             if block_text:
                 got.append(block_text)
+        if include_message_blocks:
+            for mb in att.get("message_blocks", []) or []:
+                if not isinstance(mb, dict):
+                    continue
+                inner = mb.get("message")
+                inner_blocks = (
+                    inner.get("blocks") if isinstance(inner, dict) else None
+                )
+                if not inner_blocks:
+                    continue
+                shared_text = _extract_text_from_slack_blocks(inner_blocks)
+                # Skip content already carried by text/title/fallback so a
+                # share with both text and message_blocks does not double up.
+                if shared_text and all(
+                    shared_text not in existing for existing in got
+                ):
+                    got.append(shared_text)
         # Only use the (often duplicative) fallback when nothing structured exists.
         if not got and att.get("fallback"):
             got.append(str(att["fallback"]))
@@ -2745,6 +2775,17 @@ class SlackAdapter(BasePlatformAdapter):
         if isinstance(value, str):
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return bool(value)
+
+    def _thread_rich_shares_enabled(self) -> bool:
+        """Return whether shared-message ``message_blocks`` mining is on.
+
+        Fork patch **P10**, gated on ``platforms.slack.extra.
+        thread_context_rich_shares`` (default off ⇒ stock behaviour, so a pin
+        bump that silently drops the patch reverts to safe stock rendering).
+        HQ boxes render it on via ``provision/render-config.sh``.
+        """
+        extra = self.config.extra if isinstance(self.config.extra, dict) else {}
+        return self._truthy_config(extra.get("thread_context_rich_shares", False))
 
     def native_task_cards_enabled(self) -> bool:
         """Return whether Slack-native tool progress is explicitly enabled."""
@@ -7928,7 +7969,9 @@ class SlackAdapter(BasePlatformAdapter):
     # ----- Thread context fetching -----
 
     @staticmethod
-    def _render_message_text(msg: dict, bot_uid: str = "") -> str:
+    def _render_message_text(
+        msg: dict, bot_uid: str = "", rich_shares: bool = False
+    ) -> str:
         """Return bounded display text for a Slack message, surfacing Block Kit content.
 
         Starts with ``text``, strips bot mentions, then appends rich-text
@@ -7963,7 +8006,7 @@ class SlackAdapter(BasePlatformAdapter):
         # apps often post with an empty ``text`` and the real content in
         # attachment fields or attachment-nested blocks.
         attachments_text = _extract_text_from_slack_attachments(
-            msg.get("attachments") or []
+            msg.get("attachments") or [], include_message_blocks=rich_shares
         ).strip()
         if attachments_text and attachments_text not in msg_text and all(
             attachments_text not in e for e in extras
@@ -8211,7 +8254,9 @@ class SlackAdapter(BasePlatformAdapter):
                 and msg_user == self_bot_uid
             )
 
-            msg_text = self._render_message_text(msg, bot_uid=bot_uid)
+            msg_text = self._render_message_text(
+                msg, bot_uid=bot_uid, rich_shares=self._thread_rich_shares_enabled()
+            )
             if not msg_text:
                 continue
 
@@ -8346,7 +8391,11 @@ class SlackAdapter(BasePlatformAdapter):
             if parent.get("ts", "") != thread_ts:
                 return ""
             bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
-            text = self._render_message_text(parent, bot_uid=bot_uid or "")
+            text = self._render_message_text(
+                parent,
+                bot_uid=bot_uid or "",
+                rich_shares=self._thread_rich_shares_enabled(),
+            )
             if strip_bot_mention and bot_uid:
                 text = text.replace(f"<@{bot_uid}>", "").strip()
             return text

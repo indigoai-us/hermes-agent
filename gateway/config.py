@@ -685,6 +685,15 @@ class PlatformConfig:
     # Per-channel model/provider/system_prompt overrides (channel_id -> ChannelOverride)
     channel_overrides: Dict[str, ChannelOverride] = field(default_factory=dict)
 
+    # Fork patch P11 (hq/v2): restart-free bot-token reload for Slack. When
+    # True the Slack adapter swaps a rotated bot token onto its live Web clients
+    # in place — the Socket Mode connection (authenticated with the
+    # non-rotating app token) is preserved, so no gateway restart, no dropped
+    # socket, and no interrupted in-flight turn. Default False reproduces stock
+    # behavior (token fixed at connect; operator restarts to rotate). Only the
+    # Slack adapter reads it today.
+    bot_token_reload_enabled: bool = False
+
     # Platform-specific settings
     extra: Dict[str, Any] = field(default_factory=dict)
 
@@ -695,6 +704,7 @@ class PlatformConfig:
             "reply_to_mode": self.reply_to_mode,
             "gateway_restart_notification": self.gateway_restart_notification,
             "typing_indicator": self.typing_indicator,
+            "bot_token_reload_enabled": self.bot_token_reload_enabled,
         }
         if self.typing_status_text is not None:
             result["typing_status_text"] = self.typing_status_text
@@ -739,6 +749,12 @@ class PlatformConfig:
         if _typing_text is None:
             _typing_text = extra.get("typing_status_text")
 
+        # bot_token_reload_enabled mirrors the shared-key bridging above: accept
+        # it top-level or bridged into extra by load_gateway_config().
+        _bot_reload = data.get("bot_token_reload_enabled")
+        if _bot_reload is None:
+            _bot_reload = extra.get("bot_token_reload_enabled")
+
         channel_overrides: Dict[str, ChannelOverride] = {}
         raw_overrides = data.get("channel_overrides") or {}
         if isinstance(raw_overrides, dict):
@@ -755,6 +771,7 @@ class PlatformConfig:
             gateway_restart_notification=_coerce_bool(_grn, True),
             typing_indicator=_coerce_bool(_typing, True),
             typing_status_text=_typing_text,
+            bot_token_reload_enabled=_coerce_bool(_bot_reload, False),
             channel_overrides=channel_overrides,
             extra=extra,
         )
@@ -1792,6 +1809,8 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["typing_indicator"] = platform_cfg["typing_indicator"]
                 if "typing_status_text" in platform_cfg:
                     bridged["typing_status_text"] = platform_cfg["typing_status_text"]
+                if "bot_token_reload_enabled" in platform_cfg:
+                    bridged["bot_token_reload_enabled"] = platform_cfg["bot_token_reload_enabled"]
                 # Bridge top-level port/host/secret into extra for platforms
                 # whose adapters read these from config.extra (webhook,
                 # msgraph_webhook, api_server).  Without this, YAML like:

@@ -7498,6 +7498,13 @@ class SlackAdapter(BasePlatformAdapter):
                 "slack_team_id": team_id,
                 "slack_channel_id": channel_id,
                 "slack_thread_ts": thread_ts,
+                # Fork patch P13: carry mention state past the adapter's mention
+                # strip so the gateway's shared-channel steer/redirect gate can
+                # tell a same-user @-mention (splice allowed) from ambient
+                # channel chatter (queued as a separate turn). The bot mention
+                # is stripped out of ``text`` above, so this is the only place
+                # the signal survives.
+                "hermes_is_mentioned": bool(is_mentioned),
             },
         )
 

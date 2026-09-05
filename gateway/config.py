@@ -1003,6 +1003,39 @@ class GatewayConfig:
     # so a dropped patch on a pin bump reverts to safe stock behavior. Copy
     # lives in agent/hq_branding.py.
     approval_voice_enabled: bool = False
+    # Fork patch P13 (hq/v2): master gate for ALL system-generated *per-turn*
+    # runtime system notices the gateway pushes to a platform unprompted —
+    # distinct from P9, which covers gateway lifecycle (shutdown/restart/online)
+    # broadcasts. When False, none of the following leave the process; they stay
+    # in logs/console only:
+    #   - busy acks ("⏩ Steered", "↪ Redirected current run", "⏳ Queued for
+    #     the next turn", "⚡ Interrupting current task") and their appended
+    #     "💡 First-time tip" busy hint;
+    #   - the long-tool "💡 First-time tip … /verbose" progress hint;
+    #   - the first-message profile-build onboarding offer;
+    #   - background-review deliveries ("💾 Memory updated", "💾 Self-improvement
+    #     review: …", "… User profile updated").
+    # Direct replies to a slash command the user explicitly typed (/stop,
+    # /busy status, …) are NOT system notices and are unaffected. Default True
+    # reproduces stock upstream behavior; HQ fleet boxes render this false (see
+    # hq-agents-v2 config template) so an agent posts ONLY its final reply into
+    # a shared channel (policy
+    # indigo-fleet-agents-never-broadcast-runtime-lifecycle-messages).
+    system_notices_enabled: bool = True
+
+    # Fork patch P13 (hq/v2): in a SHARED channel/thread, only splice a new
+    # inbound message into the running turn (steer / active-turn redirect) when
+    # it is safe to do so. When True:
+    #   - a message from a DIFFERENT user than the one whose request is running
+    #     never redirects/steers the run — it is queued as a separate turn;
+    #   - a message from the SAME user in the same shared thread splices only
+    #     when it @-mentions the agent;
+    #   - a DM always splices (single-owner surface).
+    # When False (default = stock upstream behavior) any authorized follow-up
+    # steers/redirects per busy_input_mode, which let one person's channel
+    # message redirect another person's running task (incident 2026-09-04). HQ
+    # boxes render this true.
+    steer_requires_same_user_mention: bool = False
 
     # STT settings
     stt_enabled: bool = True  # Whether to auto-transcribe inbound voice messages
@@ -1189,6 +1222,8 @@ class GatewayConfig:
             "filter_silence_narration": self.filter_silence_narration,
             "lifecycle_broadcasts_enabled": self.lifecycle_broadcasts_enabled,
             "approval_voice_enabled": self.approval_voice_enabled,
+            "system_notices_enabled": self.system_notices_enabled,
+            "steer_requires_same_user_mention": self.steer_requires_same_user_mention,
             "stt_enabled": self.stt_enabled,
             "stt_echo_transcripts": self.stt_echo_transcripts,
             "group_sessions_per_user": self.group_sessions_per_user,
@@ -1379,6 +1414,12 @@ class GatewayConfig:
             ),
             approval_voice_enabled=_coerce_bool(
                 data.get("approval_voice_enabled"), False
+            ),
+            system_notices_enabled=_coerce_bool(
+                data.get("system_notices_enabled"), True
+            ),
+            steer_requires_same_user_mention=_coerce_bool(
+                data.get("steer_requires_same_user_mention"), False
             ),
             stt_enabled=_coerce_bool(stt_enabled, True),
             stt_echo_transcripts=_coerce_bool(stt_echo_transcripts, True),
@@ -1644,6 +1685,28 @@ def load_gateway_config() -> GatewayConfig:
             elif isinstance(gateway_section, dict) and "approval_voice_enabled" in gateway_section:
                 gw_data["approval_voice_enabled"] = gateway_section[
                     "approval_voice_enabled"
+                ]
+
+            # Fork patch P13: per-turn system-notice master gate. Top-level
+            # wins; nested gateway.* fallback (matches lifecycle gate above).
+            if "system_notices_enabled" in yaml_cfg:
+                gw_data["system_notices_enabled"] = yaml_cfg[
+                    "system_notices_enabled"
+                ]
+            elif isinstance(gateway_section, dict) and "system_notices_enabled" in gateway_section:
+                gw_data["system_notices_enabled"] = gateway_section[
+                    "system_notices_enabled"
+                ]
+
+            # Fork patch P13: shared-channel steer/redirect safety gate. Same
+            # top-level-wins, nested gateway.* fallback shape.
+            if "steer_requires_same_user_mention" in yaml_cfg:
+                gw_data["steer_requires_same_user_mention"] = yaml_cfg[
+                    "steer_requires_same_user_mention"
+                ]
+            elif isinstance(gateway_section, dict) and "steer_requires_same_user_mention" in gateway_section:
+                gw_data["steer_requires_same_user_mention"] = gateway_section[
+                    "steer_requires_same_user_mention"
                 ]
 
             if "unauthorized_dm_behavior" in yaml_cfg:

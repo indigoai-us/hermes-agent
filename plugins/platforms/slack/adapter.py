@@ -1331,6 +1331,25 @@ class SlackAdapter(BasePlatformAdapter):
         # Allow at least this long after (re)connect before treating a missing
         # first ping/pong as evidence of a wedged transport.
         self._socket_first_ping_grace_s = 60.0
+        # Fork patch P11 (hq/v2): restart-free bot-token reload. Socket Mode
+        # authenticates with the NON-rotating app token (xapp), so a rotated
+        # BOT token (xoxb) only invalidates the Web API clients — not the
+        # websocket. When enabled we swap the bot token on the live Web clients
+        # in place (no process restart, no socket drop, no lost in-flight turn)
+        # once a rotation is observed via the sentinel/token file the refresher
+        # writes, or reactively after a Web API auth error. Default OFF ⇒ the
+        # stock behavior (token fixed at connect; operator restarts to rotate).
+        self._bot_token_reload_lock = asyncio.Lock()
+        # The SLACK_BOT_TOKEN *source* string last loaded (config.token before
+        # the slack_tokens.json merge). Reload compares against this so saved
+        # OAuth workspaces are never disturbed by a primary-token rotation.
+        self._loaded_bot_token_raw: Optional[str] = None
+        # Cheap change probe (path, mtime_ns, size) for the reload sentinel /
+        # token file, sampled each watchdog tick.
+        self._bot_token_reload_baseline: Optional[Tuple[Any, ...]] = None
+        # Set by the Web API error classifier when it sees invalid_auth /
+        # token_revoked; the watchdog picks it up and reloads within a tick.
+        self._pending_auth_reload = False
 
     async def _close_workspace_clients(self) -> None:
         """Close any Slack SDK clients that may own aiohttp sessions."""
@@ -1356,6 +1375,188 @@ class SlackAdapter(BasePlatformAdapter):
                 if inspect.isawaitable(result):
                     await result
                 break
+
+    # ── Fork patch P11: restart-free bot-token reload ────────────────────────
+    def _bot_token_reload_enabled(self) -> bool:
+        """Whether restart-free bot-token reload is turned on for this adapter.
+
+        Gated on ``platforms.slack.bot_token_reload_enabled`` (PlatformConfig
+        field, default False ⇒ stock behavior). Kept a method, not a cached
+        bool, so a live config reload takes effect without reconstructing the
+        adapter.
+        """
+        return bool(getattr(self.config, "bot_token_reload_enabled", False))
+
+    def _read_reloaded_bot_token(self) -> Optional[str]:
+        """Read the current SLACK_BOT_TOKEN *source* string for a reload.
+
+        Prefers ``SLACK_BOT_TOKEN_FILE`` — a root-owned file the refresher
+        rewrites atomically when hq-pro rotates the token. Under systemd the
+        process environment (``EnvironmentFile=``) is only read at start, so a
+        file is the only source that reflects a rotation without a restart; the
+        ``get_secret`` fallback exists solely for hosts that hot-update the
+        process environment. Never logs the value.
+        """
+        path = os.getenv("SLACK_BOT_TOKEN_FILE")
+        if path:
+            try:
+                raw = _Path(path).read_text(encoding="utf-8").strip()
+            except Exception:
+                logger.warning(
+                    "[Slack] token reload: could not read SLACK_BOT_TOKEN_FILE",
+                    exc_info=True,
+                )
+                return None
+            return raw or None
+        try:
+            return get_secret("SLACK_BOT_TOKEN")
+        except UnscopedSecretError:
+            return os.getenv("SLACK_BOT_TOKEN")
+
+    def _bot_token_reload_signature(self) -> Optional[Tuple[Any, ...]]:
+        """A cheap (path, mtime_ns, size) probe over the sentinel + token file.
+
+        The refresher touches ``SLACK_BOT_TOKEN_RELOAD_SENTINEL`` (and rewrites
+        the token file) on every rotation; a change in this signature is the
+        watchdog's proactive reload trigger.
+        """
+        sig: List[Any] = []
+        for path in (
+            os.getenv("SLACK_BOT_TOKEN_RELOAD_SENTINEL"),
+            os.getenv("SLACK_BOT_TOKEN_FILE"),
+        ):
+            if not path:
+                continue
+            try:
+                st = os.stat(path)
+                sig.append((path, st.st_mtime_ns, st.st_size))
+            except OSError:
+                sig.append((path, None, None))
+        return tuple(sig) if sig else None
+
+    async def _safe_close_client(self, client: Any) -> None:
+        for method_name in ("close", "aclose"):
+            closer = getattr(client, method_name, None)
+            if not callable(closer):
+                continue
+            try:
+                result = closer()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:  # pragma: no cover - defensive
+                logger.debug("[Slack] token reload: client close failed", exc_info=True)
+            break
+
+    async def _reload_bot_token(self, *, reason: str) -> bool:
+        """Swap a rotated bot token onto the live Web clients, in place.
+
+        Returns True iff a rotation was applied. The Socket Mode handler is left
+        untouched: it authenticates with the app token, which does not rotate.
+        Only the *source* token(s) (``config.token`` = SLACK_BOT_TOKEN) are
+        remapped; saved OAuth workspaces loaded from ``slack_tokens.json`` are
+        preserved, so a primary-token rotation never disturbs them. For a
+        same-workspace rotation (the common case) this is a pure attribute swap
+        with no network round-trip and no disruption to in-flight sends.
+        """
+        if not self._bot_token_reload_enabled() or self._app is None:
+            return False
+        fresh_raw = self._read_reloaded_bot_token()
+        if not fresh_raw or fresh_raw == self._loaded_bot_token_raw:
+            return False
+
+        async with self._bot_token_reload_lock:
+            # Re-check under the lock: the watchdog and the reactive path can
+            # both fire, and a concurrent reload may already have applied this.
+            if fresh_raw == self._loaded_bot_token_raw:
+                return False
+            fresh_tokens = [t.strip() for t in fresh_raw.split(",") if t.strip()]
+            if not fresh_tokens:
+                return False
+            old_tokens = [
+                t.strip()
+                for t in (self._loaded_bot_token_raw or "").split(",")
+                if t.strip()
+            ]
+
+            # Update the bolt app client (inbound event context) to the new
+            # primary token in place.
+            try:
+                self._app.client.token = fresh_tokens[0]
+            except Exception:
+                logger.warning(
+                    "[Slack] token reload: could not update app client token",
+                    exc_info=True,
+                )
+                return False
+
+            # Remap each source token onto its outbound per-workspace client.
+            for idx, new_tok in enumerate(fresh_tokens):
+                old_tok = old_tokens[idx] if idx < len(old_tokens) else None
+                if old_tok is not None and old_tok == new_tok:
+                    continue  # this workspace's token did not change
+                updated_in_place = False
+                if old_tok is not None:
+                    for client in self._team_clients.values():
+                        if getattr(client, "token", None) == old_tok:
+                            client.token = new_tok  # same workspace, pure swap
+                            updated_in_place = True
+                            break
+                if updated_in_place:
+                    continue
+                # A brand-new source token with no existing client: mint one and
+                # identify its workspace so outbound sends route correctly.
+                client = AsyncWebClient(
+                    token=new_tok,
+                    user_agent_prefix=_HERMES_SLACK_USER_AGENT_PREFIX,
+                )
+                _apply_slack_proxy(client, self._proxy_url)
+                try:
+                    auth = await client.auth_test()
+                except Exception as exc:
+                    logger.warning(
+                        "[Slack] token reload: auth_test failed for a rotated "
+                        "token (%s); leaving prior clients in place",
+                        type(exc).__name__,
+                    )
+                    await self._safe_close_client(client)
+                    return False
+                team_id = auth.get("team_id", "")
+                self._team_clients[team_id] = client
+                self._team_bot_user_ids[team_id] = auth.get("user_id", "")
+                self._team_bot_names[team_id] = auth.get("user", "unknown")
+
+            self.config.token = fresh_raw
+            self._loaded_bot_token_raw = fresh_raw
+            self._pending_auth_reload = False
+            logger.info(
+                "[Slack] Bot token reloaded in place (%s); Socket Mode "
+                "connection preserved, no restart",
+                reason,
+            )
+            return True
+
+    async def _maybe_reload_bot_token_from_watchdog(self) -> None:
+        """Watchdog hook: reload when the sentinel/token file changed or an auth
+        error was flagged. Both triggers are gated on the reload flag; on the
+        flag-off path this is a no-op so stock behavior is byte-for-byte."""
+        if not self._bot_token_reload_enabled():
+            return
+        signature = self._bot_token_reload_signature()
+        changed = signature != self._bot_token_reload_baseline
+        if not (changed or self._pending_auth_reload):
+            return
+        # Advance the baseline BEFORE the reload so a reload failure does not
+        # spin every tick; the reactive flag / next sentinel touch re-arms it.
+        self._bot_token_reload_baseline = signature
+        try:
+            await self._reload_bot_token(
+                reason="sentinel" if changed else "invalid_auth"
+            )
+        except Exception:  # pragma: no cover - defensive; watchdog must survive
+            logger.warning(
+                "[Slack] token reload attempt failed; will retry on next signal",
+                exc_info=True,
+            )
 
     @staticmethod
     def _slack_timestamp_sort_key(ts: Any) -> Tuple[int, int, str]:
@@ -1619,6 +1820,10 @@ class SlackAdapter(BasePlatformAdapter):
                     # but the client keeps retrying; ping/pong staleness catches
                     # that wedged-zombie case that the bool check above misses.
                     await self._restart_socket_mode("ping/pong stale")
+
+                # Fork patch P11: pick up a rotated bot token without a restart.
+                # No-op unless reload is enabled (flag off ⇒ stock behavior).
+                await self._maybe_reload_bot_token_from_watchdog()
             except asyncio.CancelledError:
                 raise
             except Exception:  # pragma: no cover - defensive logging
@@ -1714,6 +1919,11 @@ class SlackAdapter(BasePlatformAdapter):
             )
             return f"Slack attachment access failed for {file_label}. {needed_hint}{provided_hint}{reinstall_hint}"
         if error in {"not_authed", "invalid_auth", "account_inactive", "token_revoked"}:
+            # Fork patch P11: an auth failure on a live Web call is the reactive
+            # trigger for a restart-free reload. Flag it (cheap, sync); the
+            # watchdog applies the swap within a tick. No-op unless enabled.
+            if error in {"invalid_auth", "token_revoked"} and self._bot_token_reload_enabled():
+                self._pending_auth_reload = True
             return f"Slack attachment access failed for {file_label} because the bot token is not authorized ({error}). Refresh the token/reinstall the app."
         if error in {"file_not_found", "file_deleted"}:
             return f"Slack attachment {file_label} is no longer available ({error})."
@@ -2189,6 +2399,13 @@ class SlackAdapter(BasePlatformAdapter):
             self._team_bot_user_ids = {}
             self._bot_display_name = None
             self._team_bot_names = {}
+
+            # Fork patch P11: record the bot-token SOURCE string (before the
+            # slack_tokens.json merge) and the sentinel/token-file baseline so a
+            # later rotation is detected against a known-good starting point.
+            self._loaded_bot_token_raw = raw_token
+            self._bot_token_reload_baseline = self._bot_token_reload_signature()
+            self._pending_auth_reload = False
 
             # First token is the primary — used for AsyncApp / Socket Mode
             primary_token = bot_tokens[0]

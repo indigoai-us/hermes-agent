@@ -1232,6 +1232,10 @@ class SlackAdapter(BasePlatformAdapter):
         # be workspace-scoped markers (team_id, ts) in multi-workspace mode.
         self._approval_resolved: Dict[Any, bool] = {}
         self._APPROVAL_RESOLVED_MAX = 1000
+        # Fork patch P14: markers for voice-rendered approval prompts, so the
+        # button handler drops the robotic "Approved for session by <handle>"
+        # confirmation and uses in-voice text instead. Mirrors _approval_resolved.
+        self._approval_voice_markers: Dict[Any, bool] = {}
         # Same guard for clarify prompts (interactive multiple-choice
         # buttons); mirrors _approval_resolved.
         self._clarify_resolved: Dict[Any, bool] = {}
@@ -7538,6 +7542,240 @@ class SlackAdapter(BasePlatformAdapter):
 
     # ----- Approval button support (Block Kit) -----
 
+    def _approval_voice_enabled(self) -> bool:
+        """Fork patch P14: honor ``gateway.approval_voice_enabled``.
+
+        Default off ⇒ stock banner-style approval prompt. HQ boxes render it on.
+        """
+        try:
+            from agent import hq_branding
+
+            return hq_branding.approval_voice_enabled()
+        except Exception:
+            return False
+
+    def _approval_decision_text(
+        self, choice: str, count: int, user_name: str, voice: bool
+    ) -> str:
+        """Fork patch P14: outcome line for a resolved approval.
+
+        Voice on ⇒ a plain in-voice confirmation (or the deny/timeout line),
+        never the approver's handle. Voice off ⇒ the stock banner labels.
+        """
+        if voice:
+            from agent import hq_branding
+
+            if choice == "deny" or not count:
+                return hq_branding.approval_denied_text()
+            return hq_branding.approval_confirmation_text()
+        label_map = {
+            "once": f"✅ Approved once by {user_name}",
+            "session": f"✅ Approved for session by {user_name}",
+            "always": f"✅ Approved permanently by {user_name}",
+            "deny": f"❌ Denied by {user_name}",
+        }
+        if not count:
+            return (
+                "⌛ Approval expired — command was not run "
+                "(already timed out or resolved elsewhere)"
+            )
+        return label_map.get(choice, f"Resolved by {user_name}")
+
+    def _approval_internal_channels(self) -> set[str]:
+        """Rendered ``HQ_INTERNAL_CHANNELS`` allowlist (forced-internal ids)."""
+        extra = self.config.extra if isinstance(self.config.extra, dict) else {}
+        raw = extra.get("internal_channels")
+        out: set[str] = set()
+        if isinstance(raw, str):
+            out = {c.strip() for c in raw.replace(",", " ").split() if c.strip()}
+        elif isinstance(raw, (list, tuple, set)):
+            out = {str(c).strip() for c in raw if str(c).strip()}
+        return out
+
+    async def _channel_has_external_members(
+        self, channel_id: str, team_id: str = ""
+    ) -> bool:
+        """Fork patch P14: is this a Slack channel shared with external members?
+
+        Returns False for the forced-internal allowlist and for DMs/MPIMs.
+        Otherwise reads ``conversations.info`` shared flags (``is_ext_shared`` /
+        ``is_org_shared`` / ``is_shared``). Fails closed to True (treat as
+        external → route privately) on an API error so the ask never leaks into
+        an unclassified channel.
+        """
+        cid = str(channel_id or "")
+        if not cid:
+            return False
+        if cid in self._approval_internal_channels():
+            return False
+        # A DM/MPIM target is already private — never "external channel".
+        if cid[0] == "D":
+            return False
+        try:
+            resp = await self._get_client(
+                cid, team_id=team_id or None
+            ).conversations_info(channel=cid)
+            payload = _slack_response_payload(resp)
+            if not payload.get("ok"):
+                return True
+            ch = payload.get("channel") or {}
+            if ch.get("is_im") or ch.get("is_mpim"):
+                return False
+            return bool(
+                ch.get("is_ext_shared")
+                or ch.get("is_org_shared")
+                or ch.get("is_shared")
+            )
+        except Exception as e:
+            logger.warning(
+                "[Slack] conversations.info failed classifying channel %s for "
+                "approval routing — treating as external (private ask): %s",
+                cid,
+                e,
+            )
+            return True
+
+    async def _send_exec_approval_voice(
+        self,
+        chat_id: str,
+        command: str,
+        session_key: str,
+        description: str,
+        metadata: Optional[Dict[str, Any]],
+        allow_permanent: bool,
+        allow_session: bool,
+        smart_denied: bool,
+    ) -> SendResult:
+        """Fork patch P14: human-voiced approval ask (see hq_branding).
+
+        The message body is a plain ask to the requester; the raw (already
+        redacted) command is folded into a threaded ``details:`` reply, never
+        the body. In a channel with external members the ask is sent privately
+        to the requester (or the configured owner) and nothing is posted in the
+        channel until the answer is in hand.
+        """
+        from agent import hq_branding
+
+        team_id = self._metadata_team_id(metadata)
+        md = metadata if isinstance(metadata, dict) else {}
+        requester_id = str(md.get("user_id") or md.get("sender_id") or "")
+
+        # Route: external channel ⇒ DM the requester (or the owner if the
+        # requester is unknown); post nothing in the channel.
+        target = chat_id
+        thread_ts: Optional[str] = self._resolve_thread_ts(None, metadata)
+        routed_private = False
+        if await self._channel_has_external_members(chat_id, team_id):
+            extra = self.config.extra if isinstance(self.config.extra, dict) else {}
+            owner_id = str(extra.get("approval_owner") or "")
+            dm_user = requester_id or owner_id
+            if dm_user:
+                target = dm_user
+                thread_ts = None  # DM root, not the shared thread
+                routed_private = True
+            else:
+                logger.warning(
+                    "[Slack] approval ask for external channel %s has no "
+                    "requester/owner to DM; sending the ask only (no details)",
+                    chat_id,
+                )
+
+        target = await self._ensure_dm_conversation(target, team_id=team_id)
+
+        requester_name = ""
+        if requester_id:
+            try:
+                requester_name = await self._resolve_user_name(
+                    requester_id, chat_id=chat_id, team_id=team_id
+                )
+            except Exception:
+                requester_name = ""
+
+        intent = hq_branding.summarize_command_intent(command, description)
+        ask = hq_branding.approval_ask_text(requester_name, intent)
+
+        actions = [
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Allow Once"},
+                "style": "primary",
+                "action_id": "hermes_approve_once",
+                "value": session_key,
+            },
+        ]
+        if not smart_denied and allow_session:
+            actions.append({
+                "type": "button",
+                "text": {"type": "plain_text", "text": "Allow Session"},
+                "action_id": "hermes_approve_session",
+                "value": session_key,
+            })
+            if allow_permanent:
+                actions.append({
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Always Allow"},
+                    "action_id": "hermes_approve_always",
+                    "value": session_key,
+                })
+        actions.append({
+            "type": "button",
+            "text": {"type": "plain_text", "text": "Deny"},
+            "style": "danger",
+            "action_id": "hermes_deny",
+            "value": session_key,
+        })
+        blocks = [
+            {"type": "section", "text": {"type": "mrkdwn", "text": ask}},
+            {"type": "actions", "elements": actions},
+        ]
+        kwargs: Dict[str, Any] = {
+            "channel": target,
+            "text": ask,
+            "blocks": sanitize_blocks(blocks),
+        }
+        if thread_ts:
+            kwargs["thread_ts"] = thread_ts
+
+        try:
+            result = await self._get_client(
+                target, team_id=team_id
+            ).chat_postMessage(**kwargs)
+        except Exception as e:
+            logger.error("[Slack] send_exec_approval (voice) failed: %s", e, exc_info=True)
+            return SendResult(success=False, error=str(e))
+
+        msg_ts = result.get("ts", "")
+        if msg_ts:
+            self._approval_resolved[
+                self._workspace_message_marker(team_id, msg_ts)
+            ] = False
+            # Mark this approval as voice-rendered so the button handler drops
+            # the robotic "Approved for session by <handle>" confirmation.
+            self._approval_voice_markers[
+                self._workspace_message_marker(team_id, msg_ts)
+            ] = True
+            self._trim_oldest_dict_entries(
+                self._approval_resolved, self._APPROVAL_RESOLVED_MAX
+            )
+            self._trim_oldest_dict_entries(
+                self._approval_voice_markers, self._APPROVAL_RESOLVED_MAX
+            )
+
+        # Fold the raw (already redacted) command into a threaded details reply
+        # — never in the ask body. Reply under the ask message so the approver
+        # can expand it; on failure the ask still stands.
+        if msg_ts:
+            try:
+                await self._get_client(target, team_id=team_id).chat_postMessage(
+                    channel=target,
+                    thread_ts=msg_ts,
+                    text=hq_branding.approval_details_block(command),
+                )
+            except Exception as e:
+                logger.debug("[Slack] approval details reply failed: %s", e)
+
+        return SendResult(success=True, message_id=msg_ts, raw_response=result)
+
     async def send_exec_approval(
         self,
         chat_id: str,
@@ -7556,6 +7794,21 @@ class SlackAdapter(BasePlatformAdapter):
         """
         if not self._app:
             return SendResult(success=False, error="Not connected")
+
+        # Fork patch P14: HQ boxes speak the approval ask as a person and route
+        # it privately when the channel has external members. Default off ⇒ the
+        # stock banner path below runs byte-identically.
+        if self._approval_voice_enabled():
+            return await self._send_exec_approval_voice(
+                chat_id,
+                command,
+                session_key,
+                description,
+                metadata,
+                allow_permanent,
+                allow_session,
+                smart_denied,
+            )
 
         chat_id = await self._ensure_dm_conversation(
             chat_id, team_id=self._metadata_team_id(metadata)
@@ -8117,19 +8370,18 @@ class SlackAdapter(BasePlatformAdapter):
             )
             count = 0
 
+        # Fork patch P14: when this approval was voice-rendered, the outcome is
+        # spoken as a person via agent/hq_branding — a plain confirmation (never
+        # the handle, never a robotic "approved by …" banner) and an in-voice
+        # line on deny/timeout. Consume the marker either way.
+        voice_marker = self._approval_voice_markers.pop(approval_key, None)
+        if voice_marker is None and msg_ts != approval_key:
+            voice_marker = self._approval_voice_markers.pop(msg_ts, None)
+
         # Update the message to show the decision and remove buttons
-        label_map = {
-            "once": f"✅ Approved once by {user_name}",
-            "session": f"✅ Approved for session by {user_name}",
-            "always": f"✅ Approved permanently by {user_name}",
-            "deny": f"❌ Denied by {user_name}",
-        }
-        decision_text = label_map.get(choice, f"Resolved by {user_name}")
-        if not count:
-            decision_text = (
-                "⌛ Approval expired — command was not run "
-                "(already timed out or resolved elsewhere)"
-            )
+        decision_text = self._approval_decision_text(
+            choice, count, user_name, bool(voice_marker)
+        )
 
         # Get original text from the section block
         original_text = ""

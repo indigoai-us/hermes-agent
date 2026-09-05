@@ -993,6 +993,17 @@ class GatewayConfig:
     # toggle, which this gate supersedes when off.
     lifecycle_broadcasts_enabled: bool = True
 
+    # Fork patch P14 (hq/v2): approval-voice presentation. When True (HQ boxes
+    # render it so), command-approval prompts read as a person — a plain ask to
+    # the requester, the raw command folded into a details reply, no robotic
+    # "Command Approval Required" banner or "Approved for session by <handle>"
+    # confirmation, and in a channel with external members the ask goes to the
+    # requester privately. The approval GATE is unchanged; only the wording and
+    # routing change. Default False reproduces stock upstream approval prompts,
+    # so a dropped patch on a pin bump reverts to safe stock behavior. Copy
+    # lives in agent/hq_branding.py.
+    approval_voice_enabled: bool = False
+
     # STT settings
     stt_enabled: bool = True  # Whether to auto-transcribe inbound voice messages
     stt_echo_transcripts: bool = True  # Whether to echo raw STT transcripts back to the user
@@ -1177,6 +1188,7 @@ class GatewayConfig:
             "always_log_local": self.always_log_local,
             "filter_silence_narration": self.filter_silence_narration,
             "lifecycle_broadcasts_enabled": self.lifecycle_broadcasts_enabled,
+            "approval_voice_enabled": self.approval_voice_enabled,
             "stt_enabled": self.stt_enabled,
             "stt_echo_transcripts": self.stt_echo_transcripts,
             "group_sessions_per_user": self.group_sessions_per_user,
@@ -1364,6 +1376,9 @@ class GatewayConfig:
             ),
             lifecycle_broadcasts_enabled=_coerce_bool(
                 data.get("lifecycle_broadcasts_enabled"), True
+            ),
+            approval_voice_enabled=_coerce_bool(
+                data.get("approval_voice_enabled"), False
             ),
             stt_enabled=_coerce_bool(stt_enabled, True),
             stt_echo_transcripts=_coerce_bool(stt_echo_transcripts, True),
@@ -1618,6 +1633,17 @@ def load_gateway_config() -> GatewayConfig:
             elif isinstance(gateway_section, dict) and "lifecycle_broadcasts_enabled" in gateway_section:
                 gw_data["lifecycle_broadcasts_enabled"] = gateway_section[
                     "lifecycle_broadcasts_enabled"
+                ]
+
+            # Fork patch P14: approval-voice gate. Top-level wins; nested
+            # gateway.* fallback (matches lifecycle_broadcasts_enabled).
+            if "approval_voice_enabled" in yaml_cfg:
+                gw_data["approval_voice_enabled"] = yaml_cfg[
+                    "approval_voice_enabled"
+                ]
+            elif isinstance(gateway_section, dict) and "approval_voice_enabled" in gateway_section:
+                gw_data["approval_voice_enabled"] = gateway_section[
+                    "approval_voice_enabled"
                 ]
 
             if "unauthorized_dm_behavior" in yaml_cfg:

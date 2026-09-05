@@ -4099,6 +4099,24 @@ def _load_gateway_config(config_path: "Path | None" = None) -> dict:
     return raw
 
 
+def _dict_system_notices_enabled(cfg: dict | None) -> bool:
+    """Fork patch P13: read ``system_notices_enabled`` from a raw config dict.
+
+    Mirrors the GatewayConfig loader precedence (top-level key wins, then the
+    nested ``gateway.*`` fallback) so dict-context callers — the tool-progress
+    onboarding hint and the profile-build offer — honor the same master gate the
+    GatewayConfig object enforces on the busy-ack path. Fail-open (True) when
+    the config is missing or unset, matching stock upstream behavior."""
+    if not isinstance(cfg, dict):
+        return True
+    if "system_notices_enabled" in cfg:
+        return is_truthy_value(cfg.get("system_notices_enabled"), default=True)
+    val = cfg_get(cfg, "gateway", "system_notices_enabled", default=None)
+    if val is None:
+        return True
+    return is_truthy_value(val, default=True)
+
+
 def _checkpoint_agent_kwargs(config: dict | None) -> dict:
     """Translate gateway checkpoint config into ``AIAgent`` constructor args.
 
@@ -4786,7 +4804,15 @@ class TurnRunner:
                         cfg_get(_cfg, "display", "tool_progress_command"),
                         default=False,
                     )
-                    if gate_on and not is_seen(_cfg, TOOL_PROGRESS_FLAG):
+                    # Fork patch P13: gate the "💡 First-time tip … /verbose"
+                    # progress hint behind the per-turn system-notice master
+                    # switch. Off ⇒ never emitted and the seen-flag is NOT
+                    # latched, so it can still surface if the flag is re-enabled.
+                    if (
+                        gate_on
+                        and _dict_system_notices_enabled(_cfg)
+                        and not is_seen(_cfg, TOOL_PROGRESS_FLAG)
+                    ):
                         ctx.long_tool_hint_fired[0] = True
                         ctx.progress_queue.put(tool_progress_hint_gateway())
                         mark_seen(_hermes_home / "config.yaml", TOOL_PROGRESS_FLAG)
@@ -6361,6 +6387,16 @@ class TurnRunner:
         # Background review delivery — send "💾 Memory updated" etc. to user
         def _bg_review_send(message: str) -> None:
             if not ctx._status_adapter or not ctx._run_still_current():
+                return
+            # Fork patch P13: the per-turn system-notice master gate. Off ⇒ the
+            # runtime never pushes "💾 Memory updated" / "💾 Self-improvement
+            # review: …" / "… User profile updated" summaries to a platform;
+            # they remain on the console via agent._safe_print. HQ fleet boxes
+            # post ONLY the final reply into a shared channel.
+            if not _dict_system_notices_enabled(getattr(ctx, "user_config", None)):
+                logger.debug(
+                    "Background-review notice suppressed: system_notices_enabled=false"
+                )
                 return
             if not _bg_review_release.is_set():
                 with _bg_review_pending_lock:
@@ -11088,6 +11124,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key,
             )
             effective_mode = "queue"
+        # Fork patch P13: shared-channel steer/redirect safety gate. In a
+        # shared channel/thread a message from a DIFFERENT user than the one
+        # whose request is running must NOT splice into the run (steer or
+        # active-turn redirect) — nor hard-interrupt it; and a same-user message
+        # splices only when it @-mentions the agent. When the gate blocks the
+        # splice we downgrade to queue semantics (the message is answered as its
+        # own separate turn) and suppress the acknowledgment entirely, so no
+        # "↪ Redirected"/"⏩ Steered"/"⏳ Queued" bubble is posted for the
+        # other person's message. No-op when steer_requires_same_user_mention is
+        # false (default = stock upstream behavior).
+        _p13_suppress_ack = False
+        if effective_mode in ("steer", "interrupt") and not self._active_turn_splice_allowed(
+            event, session_key
+        ):
+            logger.info(
+                "P13 steer/redirect gate: downgrading busy_input_mode %r to "
+                "'queue' for session %s (shared-channel cross-user or "
+                "unmentioned same-user follow-up)",
+                effective_mode,
+                session_key,
+            )
+            effective_mode = "queue"
+            _p13_suppress_ack = True
+
         steered = False
         redirected = False
         if effective_mode == "steer":
@@ -11194,6 +11254,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not busy_ack_enabled:
             logger.debug("Busy ack suppressed for session %s", session_key)
             return True  # input still processed, just no ack sent
+
+        # Fork patch P13: the per-turn system-notice master gate. When system
+        # notices are disabled (HQ fleet boxes), the runtime posts ONLY its
+        # final reply — every busy ack (⏩/↪/⏳/⚡) and its appended first-time
+        # tip stays out of the channel; the input is still steered/queued/
+        # interrupted above. Also suppressed when the P13 steer gate downgraded
+        # a cross-user / unmentioned follow-up to queue (no ack for the other
+        # person's message).
+        if not self._system_notices_enabled():
+            logger.debug(
+                "Busy ack suppressed for session %s: system_notices_enabled=false",
+                session_key,
+            )
+            return True
+        if _p13_suppress_ack:
+            logger.debug(
+                "Busy ack suppressed for session %s: P13 steer/redirect gate",
+                session_key,
+            )
+            return True
 
         # Debounce before consulting config-heavy display settings. Rapid
         # follow-ups should be processed but should not trigger another config
@@ -20466,6 +20546,67 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    # ------------------------------------------------------------------
+    # Fork patch P13 — per-turn system-notice master gate + shared-channel
+    # steer/redirect safety.
+    # ------------------------------------------------------------------
+    def _system_notices_enabled(self) -> bool:
+        """True when the runtime may push unprompted per-turn system notices
+        (busy acks, first-time tips, memory/self-improvement summaries, the
+        profile-build offer) to a platform. HQ fleet boxes render this false so
+        an agent posts ONLY its final reply into a shared channel. Fail-open
+        (True) when the config attribute is missing or not a real bool (stock
+        upstream; also keeps MagicMock-config unit tests on stock behavior)."""
+        val = getattr(self.config, "system_notices_enabled", True)
+        return val if isinstance(val, bool) else True
+
+    @staticmethod
+    def _event_mentions_agent(event) -> bool:
+        """True when this inbound event explicitly @-mentions the agent.
+
+        Adapters strip the bot mention out of ``event.text`` before dispatch,
+        so mention state is carried on ``event.metadata['hermes_is_mentioned']``
+        (set by the Slack adapter; other adapters may add it). A DM is treated
+        as an implicit mention by callers, not here. Missing metadata ⇒ False
+        (treated as unmentioned, the conservative default for the steer gate)."""
+        try:
+            meta = getattr(event, "metadata", None) or {}
+            return bool(meta.get("hermes_is_mentioned"))
+        except Exception:
+            return False
+
+    def _active_turn_splice_allowed(self, event, session_key: str) -> bool:
+        """Fork patch P13: may this inbound message splice into the running
+        turn (steer / active-turn redirect) rather than queue as its own turn?
+
+        When ``steer_requires_same_user_mention`` is False (default = stock),
+        always True — behavior is unchanged. When True (HQ boxes):
+          - a DM always splices (single-owner surface);
+          - in a shared channel/thread a message from a DIFFERENT user than the
+            one whose request is running never splices (queued as a separate
+            turn) — this closes the cross-person redirect incident 2026-09-04;
+          - a same-user message in a shared thread splices only when it
+            @-mentions the agent.
+        """
+        gate = getattr(self.config, "steer_requires_same_user_mention", False)
+        if not (isinstance(gate, bool) and gate):
+            # Stock behavior — also the path for a MagicMock config in unit
+            # tests, whose auto-attributes are truthy but not real bools.
+            return True
+        source = getattr(event, "source", None)
+        chat_type = getattr(source, "chat_type", None) if source else None
+        if chat_type == "dm":
+            return True
+        # Shared channel/thread. Compare against the user whose request the
+        # running turn belongs to (the cached live source for this session).
+        owner_source = self._get_cached_session_source(session_key)
+        owner_user = getattr(owner_source, "user_id", None) if owner_source else None
+        incoming_user = getattr(source, "user_id", None) if source else None
+        same_user = bool(owner_user) and owner_user == incoming_user
+        if not same_user:
+            return False  # different user in a shared surface: never splice
+        return self._event_mentions_agent(event)
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -22038,8 +22179,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     profile_build_mode,
                 )
                 _onb_cfg = _load_gateway_config()
+                # Fork patch P13: when per-turn system notices are disabled (HQ
+                # fleet boxes), skip the profile-build offer — its directive
+                # drives the "💾 Self-improvement review: User profile updated"
+                # self-edit notice — and fall back to the plain self-intro. The
+                # seen-flag is NOT latched so the offer can still surface if the
+                # gate is re-enabled.
                 if (
-                    profile_build_mode(_onb_cfg) == "ask"
+                    _dict_system_notices_enabled(_onb_cfg)
+                    and profile_build_mode(_onb_cfg) == "ask"
                     and not is_seen(_onb_cfg, PROFILE_BUILD_FLAG)
                 ):
                     turn_sidecar_notes.append(profile_build_directive().strip())

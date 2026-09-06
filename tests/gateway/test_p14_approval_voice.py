@@ -143,11 +143,13 @@ class TestFlagOnVoice:
         assert first["blocks"][1]["type"] == "actions"
 
     @pytest.mark.asyncio
-    async def test_raw_command_never_in_channel_details_goes_to_requester_dm(self):
-        # P14.2: on an INTERNAL channel the ask + buttons post in-channel, but
-        # the raw command is NOT folded into a channel thread reply (every
-        # channel member could expand it — the 2026-09 lilo-social/Stitch
-        # leak). It goes to the requester's DM instead, or nowhere.
+    async def test_p143_non_owner_requester_gets_no_details_on_slack(self):
+        # P14.3: on an INTERNAL channel the ask + buttons post in-channel, and
+        # the command details are NOT sent on Slack at all when the requester is
+        # not the agent's owner/admin — not to the channel, not to a thread, not
+        # even to the requester's DM. The folded command reaches only the
+        # owner's HQ DM (Deacon leak, 2026-09-06). No approval_owner configured
+        # ⇒ nobody is an owner ⇒ nothing but the ask.
         adapter, client = _make_adapter()
         client.chat_postMessage = AsyncMock(
             side_effect=[{"ts": "1.1"}, {"ts": "1.2"}]
@@ -170,16 +172,147 @@ class TestFlagOnVoice:
                 metadata=_md(user_id="U123"),
             )
 
+        # Exactly one send — the ask — to the channel. No details anywhere.
+        assert client.chat_postMessage.call_count == 1
+        only = client.chat_postMessage.call_args_list[0].kwargs
+        assert only["channel"] == "C1"
+        for call in client.chat_postMessage.call_args_list:
+            blob = str(call.kwargs.get("text", "")) + str(
+                call.kwargs.get("blocks", "")
+            )
+            assert "meta-data" not in blob
+            assert "169.254.169.254" not in blob
+            assert not str(call.kwargs.get("text", "")).startswith("details:")
+
+    @pytest.mark.asyncio
+    async def test_p143_owner_requester_gets_redacted_details_dm_never_channel(self):
+        # P14.3: when the requester IS the configured owner, the details reply
+        # is delivered to their private DM (a real D… conversation), redacted of
+        # runtime/tool internals, secret names and file paths, and NEVER to a
+        # channel or a channel thread.
+        adapter, client = _make_adapter(extra={"approval_owner": "U123"})
+        client.chat_postMessage = AsyncMock(
+            side_effect=[{"ts": "1.1"}, {"ts": "1.2"}]
+        )
+        client.conversations_info = AsyncMock(
+            return_value={"ok": True, "channel": {"is_ext_shared": False}}
+        )
+        client.conversations_open = AsyncMock(
+            return_value={"channel": {"id": "D999"}}
+        )
+        client.users_info = AsyncMock(
+            return_value={"user": {"profile": {"display_name": "Jacob"}}}
+        )
+
+        leak_cmd = (
+            "execute_code <<'PY'\nfrom hermes_tools import terminal\n"
+            'r=terminal("hq secrets --company indigo exec --only '
+            "HQ_OPERATOR_API_COGNITO_USERNAME,HQ_OPERATOR_API_COGNITO_PASSWORD "
+            '-- node /tmp/hq_feedback_health_snapshot.mjs",timeout=240)\nPY'
+        )
+        with patch(
+            "agent.hq_branding.approval_voice_enabled", return_value=True
+        ):
+            await adapter.send_exec_approval(
+                chat_id="C1", command=leak_cmd, session_key="s",
+                metadata=_md(user_id="U123"),
+            )
+
         assert client.chat_postMessage.call_count == 2
         ask = client.chat_postMessage.call_args_list[0].kwargs
         details = client.chat_postMessage.call_args_list[1].kwargs
-        # Ask + buttons went to the channel; details went to the requester DM.
+        # Ask went to the channel; details went ONLY to the owner's D… DM.
         assert ask["channel"] == "C1"
         assert details["channel"] == "D999"
-        assert details.get("thread_ts") in (None, "1.2")  # DM root, not a C1 thread
-        assert details["channel"] != "C1"
+        assert str(details["channel"]).startswith("D")
+        # Never a channel thread reply.
+        assert details.get("thread_ts") is None
         assert details["text"].startswith("details:")
-        assert "meta-data" in details["text"]
+        # The details text is redacted — no forbidden literals leak, even to
+        # the owner's DM.
+        for forbidden in (
+            "hermes_tools",
+            "execute_code",
+            "terminal(",
+            "_PASSWORD",
+            "_USERNAME",
+            "/tmp/",
+        ):
+            assert forbidden not in details["text"], forbidden
+
+    @pytest.mark.asyncio
+    async def test_p143_channel_shaped_owner_id_never_receives_details(self):
+        # P14.3 regression for the Deacon root cause: a channel-shaped id in
+        # config/metadata must never resolve to a details target. Even if the
+        # requester id matched a (mis-configured) channel-shaped approval_owner,
+        # the D… guard drops it — nothing but the ask is sent.
+        adapter, client = _make_adapter(extra={"approval_owner": "C1"})
+        client.chat_postMessage = AsyncMock(return_value={"ts": "1.1"})
+        client.conversations_info = AsyncMock(
+            return_value={"ok": True, "channel": {"is_ext_shared": False}}
+        )
+        # conversations_open echoes a channel id back (simulating the P14.2
+        # _ensure_dm_conversation passthrough that caused the leak).
+        client.conversations_open = AsyncMock(
+            return_value={"channel": {"id": "C1"}}
+        )
+
+        with patch(
+            "agent.hq_branding.approval_voice_enabled", return_value=True
+        ):
+            await adapter.send_exec_approval(
+                chat_id="C1", command=_META_CURL, session_key="s",
+                metadata=_md(user_id="C1"),  # channel-shaped "requester"
+            )
+
+        # Only the ask — the channel-shaped target never gets a details reply.
+        assert client.chat_postMessage.call_count == 1
+        only = client.chat_postMessage.call_args_list[0].kwargs
+        assert not str(only.get("text", "")).startswith("details:")
+        assert "meta-data" not in str(only.get("blocks", ""))
+
+    @pytest.mark.asyncio
+    async def test_p143_no_slack_bound_approval_message_carries_forbidden_literal(self):
+        # P14.3 tripwire: across every Slack-bound message in the approval flow
+        # (owner DM path included), no runtime/tool internal, secret name, or
+        # file path ever leaves. Uses the exact Deacon leak command.
+        from agent import hq_branding
+
+        adapter, client = _make_adapter(extra={"approval_owner": "U123"})
+        client.chat_postMessage = AsyncMock(
+            side_effect=[{"ts": "1.1"}, {"ts": "1.2"}]
+        )
+        client.conversations_info = AsyncMock(
+            return_value={"ok": True, "channel": {"is_ext_shared": False}}
+        )
+        client.conversations_open = AsyncMock(
+            return_value={"channel": {"id": "D999"}}
+        )
+        client.users_info = AsyncMock(
+            return_value={"user": {"profile": {"display_name": "Jacob"}}}
+        )
+
+        leak_cmd = (
+            "execute_code <<'PY'\nfrom hermes_tools import terminal\n"
+            'r=terminal("hq secrets --only FOO_TOKEN,BAR_SECRET -- '
+            'node /tmp/x.mjs",timeout=240)\nPY'
+        )
+        # Also try to smuggle a secret name via the description path.
+        with patch(
+            "agent.hq_branding.approval_voice_enabled", return_value=True
+        ):
+            await adapter.send_exec_approval(
+                chat_id="C1", command=leak_cmd, session_key="s",
+                description="dump AWS_SECRET_ACCESS_KEY from /tmp/env",
+                metadata=_md(user_id="U123"),
+            )
+
+        for call in client.chat_postMessage.call_args_list:
+            blob = (
+                str(call.kwargs.get("text", ""))
+                + str(call.kwargs.get("blocks", ""))
+            )
+            assert hq_branding.contains_forbidden_approval_literal(blob) is None, blob
 
     @pytest.mark.asyncio
     async def test_raw_command_withheld_when_no_private_target(self):

@@ -106,6 +106,9 @@ def _wire_adapter_clients(adapter, token):
     NOT registered in ``_team_clients`` (it stands in for channel_directory /
     file-upload / users-lookup clients captured at startup)."""
     adapter._token_store = _SlackBotTokenStore(primary=token)
+    # Mirror connect(): the store fans auth errors back to the adapter.
+    adapter._token_store.on_auth_error = adapter._handle_store_auth_error
+    adapter._authorize_cache = {}
     adapter._slack_auth_degraded = False
 
     app = MagicMock()

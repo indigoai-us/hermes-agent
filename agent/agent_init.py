@@ -2066,6 +2066,18 @@ def init_agent(
     # Bot Mode teammate protocol section (tools/bot_mode_probe.py) — pure
     # filesystem reads, no warm needed. Silent on non-Bot-Mode installs.
     agent._bot_mode_protocol = bool(_agent_section.get("bot_mode_protocol", True))
+    # Fork patch P18 (hq/v2): invalidate the served system prompt when a
+    # profile's SOUL/persona (capability surface) changes, for ALL sessions —
+    # not just the Bot Chat title. Stock hermes only stamps + re-checks the
+    # capability epoch on Bot Chat prompts, so on HQ boxes a SOUL.md edit never
+    # invalidated a continuing session's cached prompt (a bot kept a stale
+    # persona across releases). When on, every built prompt carries the
+    # capability-epoch stamp and the restore path rebuilds once when it drifts.
+    # Default False ⇒ upstream behavior byte-for-byte; the hq-agents-v2 template
+    # renders it True.
+    agent._system_prompt_invalidate_on_soul_change = bool(
+        _agent_section.get("system_prompt_invalidate_on_soul_change", False)
+    )
     # Session-title hint for the "Bot Chat" gate: hosts that defer the DB
     # title write past the first prompt build (tui_gateway pending_title)
     # set this so the gate doesn't depend on write ordering.

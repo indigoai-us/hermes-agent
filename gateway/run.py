@@ -155,6 +155,28 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
 )
 
 
+# Fork patch P13.1: runtime "system notice" phrases that must never reach a
+# chat surface on an HQ box (gateway.system_notices_enabled=false). Distinct
+# from _TELEGRAM_NOISY_STATUS_RE (transient compression/aux chatter, always
+# suppressed on messaging surfaces): these are the config-facing banners the
+# runtime narrates about itself — the Codex gpt-5.x compaction autoraise notice
+# and any sibling "config changed / opt back out" line — which are legitimate
+# on the CLI but read as a broken machine in a customer channel (policy
+# indigo-fleet-agents-never-broadcast-runtime-lifecycle-messages; live 2026-09
+# lilo-social/Stitch). The info glyph is matched both bare (U+2139, as the
+# runtime emits) and with the emoji variation selector (as Slack renders it).
+_SYSTEM_NOTICE_STATUS_RE = re.compile(
+    r"("
+    r"auto-compaction\s+was\s+raised"
+    r"|auto-compaction"
+    r"|opt\s+back\s+out"
+    r"|hermes\s+config\s+set"
+    r"|ℹ️?"  # ℹ / ℹ️
+    r")",
+    re.IGNORECASE,
+)
+
+
 _HYGIENE_COOLDOWN_LADDER_MULTIPLIERS = (1, 3, 9)
 # Absolute ceiling on an escalated hygiene cooldown, mirroring
 # _RECONNECT_BACKOFF_CAP above: with an operator-raised base the multiplier
@@ -594,6 +616,28 @@ def _gateway_provider_failure_voice_enabled() -> bool:
     except Exception:
         pass
     return False
+
+
+def _gateway_system_notices_enabled() -> bool:
+    """Fork patch P13.1: honor ``gateway.system_notices_enabled`` at the
+    module-level status chokepoint (``_prepare_gateway_status_message``).
+
+    P13 already gates the instance-method notices (busy ack, onboarding,
+    background-review, home-channel) via ``self.config.system_notices_enabled``.
+    But ``_prepare_gateway_status_message`` is module-level with no ``self``,
+    so the one runtime notice that still flows through it untouched — the Codex
+    gpt-5.x compaction autoraise banner (``ℹ … auto-compaction was raised … Opt
+    back out: hermes config set compression.codex_gpt55_autoraise false``),
+    replayed to every chat platform via ``_compression_warning`` — was reaching
+    customer channels. This reads the same master gate from the live gateway
+    YAML (top-level key, then nested ``gateway.*``), so HQ boxes that render
+    ``system_notices_enabled: false`` suppress it. Default True reproduces stock
+    upstream (notice shown); fail-open to True on any read error.
+    """
+    try:
+        return _dict_system_notices_enabled(_load_gateway_config())
+    except Exception:
+        return True
 
 
 def _gateway_provider_failure_cooldown_seconds() -> float:
@@ -1221,6 +1265,14 @@ def _prepare_gateway_status_message(
         return None
     if _gateway_surface_passes_raw_text(platform):
         return text
+
+    # Fork patch P13.1: suppress runtime system-notice banners on chat surfaces
+    # when the P13 master gate is off. The Codex gpt-5.x compaction autoraise
+    # notice reaches here as a "lifecycle" status replayed from
+    # ``_compression_warning`` (agent/agent_init.py) — legitimate on the CLI,
+    # but on an HQ box it must stay in logs/console, never a customer channel.
+    if _SYSTEM_NOTICE_STATUS_RE.search(text) and not _gateway_system_notices_enabled():
+        return None
 
     text = _redact_gateway_user_facing_secrets(text)
     if _TELEGRAM_NOISY_STATUS_RE.search(text):

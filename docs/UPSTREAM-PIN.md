@@ -22,6 +22,8 @@ and its tests pass.
 | P12 | Slack | Persisted thread-follow — durably record threads the bot has replied in so follow-ups survive a gateway restart / in-memory miss. | `plugins/platforms/slack/adapter.py` (`_followed_threads`, `_persist_followed_threads`) | `platforms.slack.thread_follow_replies` |
 | P13 | Gateway | Per-turn system-notice master gate + shared-channel steer gate. | `gateway/run.py`, `gateway/config.py` | `gateway.system_notices_enabled` |
 | P14 | Gateway | Approval prompts speak as a person, fold the raw command, route external channels privately. | `gateway/run.py`, `agent/hq_branding.py` | `gateway.approval_voice_enabled` |
+| **P14.2** | **Slack** | **No raw command or shell jargon in an approval ask on any channel.** The intent classifier paraphrases the pending action; a description that reads as shell/flag jargon or quotes the command falls back to a generic phrase. The raw (redacted) command is not folded into a channel thread — on an internal channel it was DM'd to the requester instead. | `plugins/platforms/slack/adapter.py` (`_send_exec_approval_voice`), `agent/hq_branding.py` (`summarize_command_intent`, `_intent_desc_is_safe`) | Inherits `gateway.approval_voice_enabled` |
+| **P14.3** | **Slack** | **Approval command details NEVER reach a channel, group, or any channel/DM thread — and are redacted before they can be shown at all.** Closes the 2026-09-06 Deacon leak: P14.2 fed `requester_id` / `approval_owner` straight into `_ensure_dm_conversation`, which returns its input unchanged when `conversations.open` fails or the id is not a U/W user id, so a channel-shaped id resolved to a `C…` target and (in the routed_private branch, `details_thread_ts=msg_ts`) posted the "details:" command as a THREAD REPLY in a shared channel. Now: (1) the ONLY Slack destination for the folded command is a verified `D…` DM to the requester WHEN they are the agent's owner/admin (`_approval_owner_ids`, sourced from `approval_owner`/`approval_admins`, fail-closed); anyone else gets nothing on Slack (the folded command reaches only the owner's HQ DM). No channel `thread_ts` is ever carried. (2) The details text is redacted of runtime/tool internals (`hermes_tools`/`execute_code`/`terminal(`), secret NAMES (`*_PASSWORD`/`*_TOKEN`/`*_KEY`/`*_SECRET`/`*_USERNAME`) and file paths (`redact_approval_details`). (3) A `contains_forbidden_approval_literal` tripwire scans the ask and every Slack-bound details message; the ask falls back to a generic phrase and a details message that still trips is withheld. | `plugins/platforms/slack/adapter.py` (`_send_exec_approval_voice`, `_approval_owner_ids`), `agent/hq_branding.py` (`redact_approval_details`, `contains_forbidden_approval_literal`, `approval_details_block`, `_intent_desc_is_safe`) | Inherits `gateway.approval_voice_enabled`; details DM gated on `platforms.slack.extra.approval_owner`/`approval_admins` |
 | P16 | Gateway | Persistent pending clarifies — a clarify request survives a gateway restart and its late reply is routed back to the resumed turn. | `gateway/run.py` | — |
 | P18 | Agent | SOUL/persona-change system-prompt invalidation for ALL sessions. Stock hermes stamps + re-checks the capability epoch only on Bot Chat prompts, so a continuing non-bot session never adopted a SOUL.md edit until a restart / `/new` / compression (a bot kept a stale persona across releases). When on, every built prompt carries the capability-epoch stamp (`capability_fingerprint()` hashes SOUL + skills + toolsets + MCP + roster) and the restore path rebuilds once when it drifts; an ordinary stale session is not re-titled "Bot Chat". Unchanged SOUL hashes identically ⇒ stored bytes reused verbatim (prefix cache preserved). | `agent/agent_init.py`, `agent/system_prompt.py`, `agent/conversation_loop.py` | `agent.system_prompt_invalidate_on_soul_change` (default off; hq-agents-v2 template renders it on) |
 
@@ -36,6 +38,18 @@ and its tests pass.
   new live-adapter code constructs a Web client from a captured token string
   outside the store-bound `_make_web_client` factory — the class of bug P11.1
   fixes. Route every new Slack Web client through `_make_web_client`.
+- P14 / P14.2 / P14.3: `tests/gateway/test_p14_approval_voice.py`,
+  `tests/agent/test_hq_branding_approval_voice.py`,
+  `tests/agent/test_hq_branding_intent_guard.py`,
+  `tests/agent/test_hq_branding_p143_redaction.py`
+  (`uv run pytest tests/gateway/test_p14_approval_voice.py tests/agent -k "hq_branding or approval"`).
+- P14.3 ships a **forbidden-literal tripwire**
+  (`test_p143_no_slack_bound_approval_message_carries_forbidden_literal` +
+  `hq_branding.contains_forbidden_approval_literal`) asserting that no
+  Slack-bound approval message — ask or owner-DM details — ever carries a
+  runtime/tool internal (`hermes_tools`/`execute_code`/`terminal(`), a secret
+  variable NAME (`*_PASSWORD`/`*_TOKEN`/`*_KEY`/`*_SECRET`/`*_USERNAME`), or a
+  file path. Any new Slack approval-path message must clear this predicate.
 - P18: `tests/agent/test_system_prompt_soul_invalidation.py`
   (`uv run pytest tests/agent/test_system_prompt_soul_invalidation.py`) — plus the
   hq-agents-v2 template render test that pins the flag renders on.

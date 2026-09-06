@@ -8073,6 +8073,34 @@ class SlackAdapter(BasePlatformAdapter):
             )
             return True
 
+    def _approval_owner_ids(self) -> set[str]:
+        """Slack user ids allowed to receive the folded approval command in DM.
+
+        Fork patch P14.3: only the agent's owner/admin may receive the command
+        details on Slack. Sourced from ``platforms.slack.extra.approval_owner``
+        (single id) plus optional ``approval_admins`` (comma/space list). A
+        requester who is not in this set gets nothing on Slack — the folded
+        command reaches only the owner's HQ DM. Empty by default ⇒ no Slack
+        details are ever sent (fail-closed).
+        """
+        extra = self.config.extra if isinstance(self.config.extra, dict) else {}
+        ids: set[str] = set()
+        owner = str(extra.get("approval_owner") or "").strip()
+        if owner:
+            ids.add(owner)
+        admins = extra.get("approval_admins")
+        if isinstance(admins, (list, tuple, set)):
+            ids.update(str(a).strip() for a in admins if str(a).strip())
+        elif isinstance(admins, str):
+            ids.update(
+                part.strip()
+                for part in re.split(r"[,\s]+", admins)
+                if part.strip()
+            )
+        # Only real Slack user ids (U…/W…) are valid DM owners; a channel id
+        # slipping into config must never be treated as an owner.
+        return {i for i in ids if i[:1] in ("U", "W")}
+
     async def _send_exec_approval_voice(
         self,
         chat_id: str,
@@ -8131,6 +8159,16 @@ class SlackAdapter(BasePlatformAdapter):
 
         intent = hq_branding.summarize_command_intent(command, description)
         ask = hq_branding.approval_ask_text(requester_name, intent)
+
+        # Fork patch P14.3: belt-and-suspenders tripwire on the ask body — the
+        # intent classifier already avoids the raw command, but if any runtime/
+        # tool internal, secret variable name, or file path ever slips into the
+        # ask, fall back to the generic phrase rather than post it to a chat
+        # surface. (Policy indigo-fleet-agents-never-broadcast-...).
+        if hq_branding.contains_forbidden_approval_literal(ask):
+            ask = hq_branding.approval_ask_text(
+                requester_name, "run a quick command on my box"
+            )
 
         actions = [
             {
@@ -8199,58 +8237,71 @@ class SlackAdapter(BasePlatformAdapter):
                 self._approval_voice_markers, self._APPROVAL_RESOLVED_MAX
             )
 
-        # Fork patch P14.2: the raw (already redacted) command NEVER goes to a
-        # channel — not even folded in a thread under the ask. On a shared /
-        # customer channel a threaded "details:" reply is still posted in the
-        # channel and every member (including externals) can expand it; that is
-        # exactly the leak seen on 2026-09 (lilo-social/Stitch), where the
-        # python3 -c env-dump command rendered inline under the ask. The
-        # command goes ONLY to a private DM with the requester (or the
-        # configured owner), or nowhere if no private target can be resolved.
-        # The ask + buttons already stand on their own; the details DM is a
-        # best-effort convenience for the approver.
+        # Fork patch P14.3: the command details NEVER reach a channel, group,
+        # or ANY channel/DM thread. The only Slack destination is a private DM
+        # to the requester WHEN the requester is the agent's configured owner/
+        # admin; otherwise nothing is sent on Slack (the folded command is
+        # delivered to the owner's HQ DM by the HQ DM path). Whatever is sent
+        # is redacted of runtime/tool internals, secret names, and file paths,
+        # and must clear the forbidden-literal tripwire before it leaves.
+        #
+        # This closes the 2026-09-06 Deacon leak: P14.2 fed ``requester_id`` /
+        # ``approval_owner`` straight into ``_ensure_dm_conversation``, which
+        # returns its input unchanged when ``conversations.open`` fails or the
+        # id is not a U/W user id — so a channel-shaped id resolved to a
+        # ``C…`` target and (in the routed_private branch) posted the "details:"
+        # command as a THREAD REPLY in a shared channel. We now require a
+        # verified ``D…`` DM conversation with an owner/admin and never carry a
+        # channel thread_ts.
         if msg_ts:
+            owner_ids = self._approval_owner_ids()
+            requester_is_owner = bool(requester_id) and requester_id in owner_ids
             details_target: Optional[str] = None
-            details_thread_ts: Optional[str] = None
-            if routed_private:
-                # ``target`` is already the requester's DM; fold under the ask.
-                details_target = target
-                details_thread_ts = msg_ts
-            else:
-                # Internal channel: the ask posted in-channel, but the command
-                # must still be private. Open a DM to the requester (or owner).
-                extra_cfg = (
-                    self.config.extra if isinstance(self.config.extra, dict) else {}
+            if requester_is_owner:
+                try:
+                    dm = await self._ensure_dm_conversation(
+                        requester_id, team_id=team_id
+                    )
+                except Exception as e:
+                    logger.debug(
+                        "[Slack] could not open approval details DM: %s", e
+                    )
+                    dm = ""
+                # Only a real, opened DM conversation (D…) is an acceptable
+                # target — never a channel (C…), group (G…), or bare user id
+                # (U/W…, which means the DM open failed).
+                if dm and str(dm).startswith("D"):
+                    details_target = dm
+            if details_target:
+                details_text = hq_branding.approval_details_block(command)
+                offending = hq_branding.contains_forbidden_approval_literal(
+                    details_text
                 )
-                owner_dm_user = requester_id or str(
-                    extra_cfg.get("approval_owner") or ""
-                )
-                if owner_dm_user:
+                if offending:
+                    # Redaction should make this impossible; if it ever fires,
+                    # withhold rather than leak.
+                    logger.error(
+                        "[Slack] approval details blocked by tripwire "
+                        "(literal=%r); not sent",
+                        offending,
+                    )
+                else:
                     try:
-                        details_target = await self._ensure_dm_conversation(
-                            owner_dm_user, team_id=team_id
+                        await self._get_client(
+                            details_target, team_id=team_id
+                        ).chat_postMessage(
+                            channel=details_target,
+                            text=details_text,
                         )
                     except Exception as e:
                         logger.debug(
-                            "[Slack] could not open approval details DM: %s", e
+                            "[Slack] approval details DM failed: %s", e
                         )
-                        details_target = None
-            if details_target:
-                try:
-                    await self._get_client(
-                        details_target, team_id=team_id
-                    ).chat_postMessage(
-                        channel=details_target,
-                        thread_ts=details_thread_ts,
-                        text=hq_branding.approval_details_block(command),
-                    )
-                except Exception as e:
-                    logger.debug("[Slack] approval details reply failed: %s", e)
             else:
                 logger.info(
-                    "[Slack] approval details withheld from channel %s "
-                    "(no private target); command not posted",
-                    chat_id,
+                    "[Slack] approval command details withheld from Slack "
+                    "(requester is not the owner/admin); the folded command is "
+                    "carried only by the owner's HQ DM",
                 )
 
         return SendResult(success=True, message_id=msg_ts, raw_response=result)

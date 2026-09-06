@@ -206,6 +206,75 @@ def approval_voice_enabled(config: Optional[dict[str, Any]] = None) -> bool:
 
 _GENERIC_INTENT = "run a quick command on my box"
 
+
+# ── Fork patch P14.3: forbidden literals for any chat-surface approval text ───
+# Deacon (indigo, v2.25) folded an ``execute_code``/``hermes_tools`` heredoc —
+# with COGNITO secret NAMES and a ``/tmp`` path — into a shared-channel thread
+# reply (2026-09-06). Even redacted of secret *values*, runtime/tool internals,
+# secret variable *names*, and file paths must never reach a Slack (or any
+# non-HQ-DM) surface. These are the tripwire literals: the raw folded command
+# is visible only in the owner's HQ DM. Policy:
+# indigo-fleet-agents-never-broadcast-runtime-lifecycle-messages.
+_APPROVAL_JARGON_RE = re.compile(
+    r"\b(?:hermes_tools|execute_code|code_execution|hermes_state|hermes_cli)\b"
+    r"|\bterminal\s*\("
+    r"|\bfrom\s+hermes_tools\b",
+    re.IGNORECASE,
+)
+# Environment-variable style secret NAMES: FOO_PASSWORD, FOO_API_TOKEN,
+# AWS_SECRET_ACCESS_KEY, *_SECRET, *_KEY, etc. (names, not values).
+_APPROVAL_SECRET_NAME_RE = re.compile(
+    r"\b[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)*"
+    r"_(?:PASSWORD|PASSWD|PWD|TOKEN|KEY|SECRET|CREDENTIAL|CREDENTIALS|APIKEY|USERNAME)\b"
+)
+# Absolute / home-relative file paths (``/tmp/...``, ``/home/...``, ``~/...``,
+# or any multi-segment absolute path).
+_APPROVAL_PATH_RE = re.compile(
+    r"(?<![\w./-])(?:~|/(?:tmp|home|Users|var|etc|opt|root|mnt|srv|usr|private))"
+    r"/[^\s\"'`)]+"
+    r"|(?<![\w./-])/(?:[A-Za-z0-9._-]+/){2,}[A-Za-z0-9._-]+"
+)
+
+
+def contains_forbidden_approval_literal(text: str) -> Optional[str]:
+    """Return the first runtime/secret-name/path literal in ``text``, else None.
+
+    The Slack approval path asserts this returns ``None`` for every message it
+    puts on a chat surface (tripwire). Used both as a test oracle and a runtime
+    guard so a later change cannot re-introduce a leak (P14.3).
+    """
+    s = str(text or "")
+    for rx in (_APPROVAL_JARGON_RE, _APPROVAL_SECRET_NAME_RE, _APPROVAL_PATH_RE):
+        m = rx.search(s)
+        if m:
+            return m.group(0)
+    return None
+
+
+def redact_approval_details(command: str) -> str:
+    """Redact a command for any approval *details* text that could be shown.
+
+    Removes secret *values* (Tirith-grade, fail-soft) AND the P14.3 forbidden
+    literals — runtime/tool internals (``hermes_tools``, ``execute_code``,
+    ``terminal(``), secret variable *names* (``*_PASSWORD``/``*_TOKEN``/
+    ``*_KEY``/``*_SECRET``), and file paths — so the result never carries
+    implementation detail onto a chat surface. The unredacted folded command
+    is delivered only to the owner's HQ DM by the HQ DM path.
+    """
+    text = str(command or "")
+    try:
+        from agent.redact import redact_sensitive_text
+
+        text = redact_sensitive_text(text, force=True)
+    except Exception:
+        # Fail-soft on the value redactor; the literal passes below still run.
+        pass
+    text = _APPROVAL_JARGON_RE.sub("[tool]", text)
+    text = _APPROVAL_SECRET_NAME_RE.sub("[secret]", text)
+    text = _APPROVAL_PATH_RE.sub("[path]", text)
+    return text
+
+
 # Fork patch P14.2: tokens that mark a "description" as runtime/shell jargon or
 # a raw command fragment, never a human intent. The upstream approval metadata
 # often carries a machine phrase like "script execution via -e/-c flag" (live
@@ -255,6 +324,11 @@ def _intent_desc_is_safe(desc: str, command: str) -> bool:
         return False
     low = d.lower()
     if low in ("dangerous command", "command", "shell command"):
+        return False
+    # P14.3: a description that names a secret var, a tool internal, or a file
+    # path is a leak even without shell punctuation — route to the generic
+    # phrase instead of echoing it into the ask.
+    if contains_forbidden_approval_literal(d):
         return False
     for marker in _JARGON_DESC_MARKERS:
         if marker in low:
@@ -324,15 +398,24 @@ def approval_ask_text(requester_name: Optional[str], intent: str) -> str:
 
 
 def approval_details_block(command: str) -> str:
-    """The raw (already-redacted) command, folded behind a details reply.
+    """The command folded behind a details reply, redacted for a chat surface.
 
-    Only ever used where the platform has a real fold (a Slack threaded reply).
-    It is NEVER appended to a buttonless chat body — on a surface with no fold
-    the "details:" line and the raw command render inline in the message, which
-    is exactly the leak P14.1 removes (odin, 2026-09-06). The buttonless text
-    fallback uses :func:`approval_reply_hint` instead.
+    Fork patch P14.3: the folded command is redacted of secret *values*,
+    runtime/tool internals (``hermes_tools``/``execute_code``/``terminal(``),
+    secret variable *names*, and file paths (:func:`redact_approval_details`),
+    so it never carries implementation detail even when routed to the owner's
+    private DM. The unredacted folded command is delivered only to the owner's
+    HQ DM by the HQ DM path.
+
+    It is NEVER appended to a buttonless chat body, and never to a channel,
+    group, or channel thread — on a surface with no fold the "details:" line
+    renders inline (odin, 2026-09-06), and on a shared channel every member can
+    expand a thread reply (Deacon, 2026-09-06). The buttonless text fallback
+    uses :func:`approval_reply_hint`; the Slack path only ever sends this to an
+    owner/admin DM after the :func:`contains_forbidden_approval_literal`
+    tripwire passes.
     """
-    cmd = (command or "").strip()
+    cmd = redact_approval_details(command).strip()
     return f"{APPROVAL_DETAILS_PREFIX}\n```\n{cmd}\n```"
 
 
@@ -396,6 +479,8 @@ __all__ = [
     "approval_details_block",
     "approval_reply_hint",
     "approval_voice_enabled",
+    "contains_forbidden_approval_literal",
+    "redact_approval_details",
     "summarize_command_intent",
     "back_online_notice",
     "busy_notice",

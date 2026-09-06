@@ -559,6 +559,152 @@ def _gateway_compression_progress_notices_enabled() -> bool:
         pass
     return False
 
+
+# ── Provider-failure in-voice notices (fork patch P17, hq/v2) ─────────────────
+# One composer for every user-facing provider/model failure (billing, auth,
+# rate-limit, outage). Behind ``gateway.provider_failure_voice_enabled``
+# (default False ⇒ stock robotic notices, so a dropped patch on a pin bump
+# reverts to safe stock behavior). HQ fleet boxes render it true (policy
+# indigo-fleet-agents-never-broadcast-runtime-lifecycle-messages) so an agent
+# posts a plain first-person line — no emoji, no raw JSON, no vendor URLs — and
+# the same failure class is said at most once per conversation per
+# ``gateway.provider_failure_notice_cooldown_seconds`` (default 3600).
+from agent import provider_failure_notice as _pfn  # noqa: E402
+
+# One process-wide gate; cooldown is refreshed live from config on each read.
+_GATEWAY_PROVIDER_FAILURE_GATE = _pfn.ProviderFailureNoticeGate(
+    cooldown_seconds=_pfn.DEFAULT_PROVIDER_FAILURE_NOTICE_COOLDOWN_SECONDS
+)
+
+
+def _gateway_provider_failure_voice_enabled() -> bool:
+    """True when the in-voice provider-failure composer (P17) is active.
+
+    Reads ``gateway.provider_failure_voice_enabled`` from the live gateway
+    YAML. Default False reproduces stock behavior (a dropped patch reverts
+    safely); HQ boxes render it true. Fail-closed to stock on any read error.
+    """
+    try:
+        config = _load_gateway_config()
+        gw = config.get("gateway") if isinstance(config, dict) else None
+        if isinstance(gw, dict) and "provider_failure_voice_enabled" in gw:
+            return str(gw.get("provider_failure_voice_enabled")).strip().lower() in {
+                "true", "1", "yes", "on",
+            }
+    except Exception:
+        pass
+    return False
+
+
+def _gateway_provider_failure_cooldown_seconds() -> float:
+    """Live ``gateway.provider_failure_notice_cooldown_seconds`` (default 3600).
+
+    <= 0 disables rate limiting (every failure announces). Fail-open to the
+    default on any read/parse error.
+    """
+    default = float(_pfn.DEFAULT_PROVIDER_FAILURE_NOTICE_COOLDOWN_SECONDS)
+    try:
+        config = _load_gateway_config()
+        gw = config.get("gateway") if isinstance(config, dict) else None
+        if isinstance(gw, dict) and "provider_failure_notice_cooldown_seconds" in gw:
+            return float(gw.get("provider_failure_notice_cooldown_seconds"))
+    except Exception:
+        pass
+    return default
+
+
+def _gateway_owner_display_name() -> Optional[str]:
+    """Best-effort owner display name for the composed notice ('the owner' if
+    unknown). Reads a few conventional config keys; never fails the caller."""
+    try:
+        config = _load_gateway_config()
+        if not isinstance(config, dict):
+            return None
+        for path in (("owner_name",), ("owner", "name"), ("hq", "owner_name")):
+            node: Any = config
+            for part in path:
+                node = node.get(part) if isinstance(node, dict) else None
+                if node is None:
+                    break
+            if isinstance(node, str) and node.strip():
+                return node.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _gateway_provider_failure_conversation_key(source: Any) -> Optional[str]:
+    """Stable per-conversation key (``platform:chat:thread``) for the cooldown.
+
+    Built from ``SessionSource`` fields (platform / chat_id / thread_id, scoped
+    by scope_id when present) so a per-thread failure is rate-limited per
+    thread, not per whole platform. Falls back to None (no rate limiting)
+    rather than raising on an odd/None source shape.
+    """
+    if source is None:
+        return None
+    try:
+        platform = getattr(source, "platform", None)
+        platform_str = getattr(platform, "value", None) or (
+            str(platform) if platform is not None else "unknown"
+        )
+        chat_id = getattr(source, "chat_id", None)
+        thread_id = getattr(source, "thread_id", None)
+        scope_id = getattr(source, "scope_id", None)
+        parts = [platform_str]
+        if scope_id:
+            parts.append(str(scope_id))
+        if chat_id:
+            parts.append(str(chat_id))
+        if thread_id:
+            parts.append(str(thread_id))
+        key = ":".join(parts)
+        return key or None
+    except Exception:
+        return None
+
+
+def _gateway_compose_provider_failure(
+    text: str, conversation_key: Optional[str]
+) -> Optional[str]:
+    """Route a detected provider failure through the P17 composer + cooldown.
+
+    Returns:
+      * the composed in-voice line when this is the first notice for
+        (conversation, class) inside the cooldown window,
+      * ``""`` to SUPPRESS (a notice for this class already went out to this
+        conversation recently — never two back to back, never repeat spam),
+      * ``None`` when ``text`` is not a provider failure (caller keeps text).
+    """
+    failure_class = _pfn.classify_failure_text(text)
+    if failure_class is None:
+        return None
+    provider = _pfn.detect_provider(text)
+    # Structured log line for the fleet monitor / hq-pro — always emitted, even
+    # when the chat notice is suppressed, so telemetry sees every failure.
+    try:
+        logger.warning(
+            "%s",
+            _pfn.structured_log_line(
+                failure_class, provider, conversation=conversation_key
+            ),
+        )
+    except Exception:
+        pass
+    gate = _GATEWAY_PROVIDER_FAILURE_GATE
+    try:
+        gate.set_cooldown(_gateway_provider_failure_cooldown_seconds())
+    except Exception:
+        pass
+    if not gate.should_emit(conversation_key, failure_class):
+        return ""  # suppress: already told this conversation about this class
+    return _pfn.compose_provider_failure_notice(
+        failure_class,
+        provider=provider,
+        owner_name=_gateway_owner_display_name(),
+    )
+
+
 # Surfaces that consume gateway text programmatically (CLI/TUI "local"
 # diagnostics, API JSON, webhook payloads) and therefore must keep RAW
 # status/error text. EVERY other platform is a human-facing chat surface
@@ -1015,7 +1161,9 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
     return bool(_GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body))
 
 
-def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
+def _sanitize_gateway_final_response(
+    platform: Any, text: str, conversation_key: Optional[str] = None
+) -> str:
     """Sanitize final gateway replies before sending them to chat surfaces.
 
     Every human-facing chat surface (Telegram, WhatsApp, Discord, Slack,
@@ -1049,12 +1197,24 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
         return ""
 
     redacted = _redact_gateway_user_facing_secrets(str(text))
+    # P17: route provider failures through the single in-voice composer (with
+    # per-conversation cooldown) when enabled. "" suppresses (a notice already
+    # went out to this conversation); a non-None string replaces the raw body.
+    if _gateway_provider_failure_voice_enabled():
+        composed = _gateway_compose_provider_failure(redacted, conversation_key)
+        if composed is not None:
+            return composed
     if _looks_like_gateway_provider_error(redacted):
         return _gateway_provider_error_reply(redacted)
     return redacted
 
 
-def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:
+def _prepare_gateway_status_message(
+    platform: Any,
+    event_type: str,
+    message: str,
+    conversation_key: Optional[str] = None,
+) -> Optional[str]:
     """Filter/sanitize agent status callbacks before platform delivery.
 
     Local/CLI sessions keep the raw diagnostic stream. Messaging gateway
@@ -1079,6 +1239,13 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
             and _COMPRESSION_PROGRESS_STATUS_RE.search(text)
         ):
             return None
+    # P17: same in-voice composer + cooldown for provider-failure STATUS lines
+    # (e.g. the agent loop's "Billing or credits exhausted — ..."), so a status
+    # notice and the final reply can never post two robotic lines back to back.
+    if _gateway_provider_failure_voice_enabled():
+        composed = _gateway_compose_provider_failure(text, conversation_key)
+        if composed is not None:
+            return composed or None  # "" ⇒ suppress this status entirely
     if _looks_like_gateway_provider_error(text):
         return _gateway_provider_error_reply(text)
     return text
@@ -5829,6 +5996,7 @@ class TurnRunner:
             ctx.source.platform,
             event_type,
             message,
+            _gateway_provider_failure_conversation_key(ctx.source),
         )
         if prepared_message is None:
             logger.debug(
@@ -7265,7 +7433,11 @@ class TurnRunner:
             final_response = _normalize_empty_agent_response(
                 result, final_response or "", history_len=len(agent_history),
             )
-            final_response = _sanitize_gateway_final_response(ctx.source.platform, final_response)
+            final_response = _sanitize_gateway_final_response(
+                ctx.source.platform,
+                final_response,
+                _gateway_provider_failure_conversation_key(ctx.source),
+            )
             if not final_response:
                 final_response = f"⚠️ {result['error']}" if result.get("error") else ""
             return {
@@ -22668,7 +22840,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 response = _normalize_empty_agent_response(
                     agent_result, response, history_len=len(history),
                 )
-                response = _sanitize_gateway_final_response(source.platform, response)
+                response = _sanitize_gateway_final_response(
+                    source.platform,
+                    response,
+                    _gateway_provider_failure_conversation_key(source),
+                )
 
             # Ordering contract: the agent thread already updated the contextvar
             # in conversation_compression.py; propagate to SessionEntry + _save().

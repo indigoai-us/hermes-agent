@@ -1048,31 +1048,27 @@ def _format_exec_approval_fallback(
     if smart_denied:
         heading = "⚠️ **Smart DENY — owner override for one operation:**"
 
-    # Fork patch P14: on HQ boxes the ask reads as a person — a plain line
-    # saying what the agent needs and why, the raw command folded into a
-    # trailing "details:" block (never the body), no robotic banner. Default
-    # off ⇒ the stock text below runs byte-identically.
+    # Fork patch P14 (+P14.1): on HQ boxes the ask reads as a person — a plain
+    # line saying what the agent needs and why, resolved by a plain "yes"/"no"
+    # reply. NO command-approval scaffold (`/approve` / `/approve session` /
+    # `/approve always` / `/deny`) and NO raw command ever reach the chat body:
+    # on a buttonless surface the old scaffold + inline "details:" block leaked
+    # verbatim into a user DM (odin, 2026-09-06; policy
+    # indigo-fleet-agents-never-broadcast-runtime-lifecycle-messages). HQ DM
+    # additionally renders this as a clickable `decision` block (hqdm
+    # send_exec_approval, #40) so the buttonless text below is only a fallback.
+    # Default off ⇒ the stock text further down runs byte-identically.
     try:
         from agent import hq_branding
 
         if hq_branding.approval_voice_enabled():
             intent = hq_branding.summarize_command_intent(command, description)
             ask = hq_branding.approval_ask_text(None, intent)
-            choices = [f"Reply `{command_prefix}approve` to go ahead"]
-            if not smart_denied and allow_session:
-                choices.append(
-                    f"`{command_prefix}approve session` to allow this for the session"
-                )
-                if allow_permanent:
-                    choices.append(
-                        f"`{command_prefix}approve always` to allow it from now on"
-                    )
-            choices.append(f"`{command_prefix}deny` to skip it")
-            return (
-                f"{ask}\n\n"
-                + ", ".join(choices[:-1]) + f", or {choices[-1]}.\n\n"
-                + hq_branding.approval_details_block(cmd_preview)
+            hint = hq_branding.approval_reply_hint(
+                allow_session=(allow_session and not smart_denied),
+                allow_permanent=allow_permanent,
             )
+            return f"{ask}\n\n{hint}"
     except Exception:
         pass
 
@@ -11245,18 +11241,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from tools.approval import has_blocking_approval
             if event.allow_gateway_control and has_blocking_approval(session_key):
                 _raw_text = (event.text or "").strip().lower()
-                _approve_words = {"approve", "yes", "ok", "okay", "confirm", "y", "👍"}
-                _deny_words = {"deny", "no", "reject", "cancel", "n", "👎"}
+                # Bare-word approve/deny plus the exact labels the P14.1 HQ DM
+                # `decision` block renders as clickable options (hqdm
+                # send_exec_approval, #40): the client posts the chosen option's
+                # label as the reply body, so "Approve" / "Approve for the
+                # session" / "Approve always" / "Deny" must each resolve here.
+                _approve_words = {
+                    "approve", "yes", "ok", "okay", "confirm", "y", "👍",
+                    "approve once", "just this once", "go ahead", "allow once",
+                }
+                _deny_words = {
+                    "deny", "no", "reject", "cancel", "n", "👎", "skip", "skip it",
+                }
                 _approval_handler = None
                 _normalized_args = ""
                 if _raw_text in _approve_words:
                     _approval_handler = self._handle_approve_command
                 elif _raw_text in _deny_words:
                     _approval_handler = self._handle_deny_command
-                elif _raw_text in {"always", "approve always", "always approve"}:
+                elif _raw_text in {
+                    "always", "approve always", "always approve",
+                }:
                     _approval_handler = self._handle_approve_command
                     _normalized_args = "always"
-                elif _raw_text in {"session", "approve session", "session approve"}:
+                elif _raw_text in {
+                    "session", "approve session", "session approve",
+                    "approve for the session", "approve for this session",
+                }:
                     _approval_handler = self._handle_approve_command
                     _normalized_args = "session"
                 if _approval_handler is not None:

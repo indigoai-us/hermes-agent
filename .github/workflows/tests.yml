@@ -14,6 +14,11 @@ concurrency:
 jobs:
   test:
     name: Run tests
+    # Standard GitHub-hosted runners (ubuntu-latest, since #16) are far
+    # slower than the 96-core runner this suite was tuned for, so 30 min was
+    # not enough — runs hit the wall clock and got cancelled mid-suite
+    # (P0-CI). Raised to 75 min. Follow-up: reintroduce matrix sharding to
+    # bring wall-clock back down (tracked separately; not done here).
     # One 96-core runner for the whole suite. There is no slicing. Slicing
     # existed to spread the suite over 4-core runners. It cost a matrix job, a
     # duration cache, a per-slice artifact and a merge job to do it.
@@ -22,7 +27,7 @@ jobs:
     # 82s). A second slice divides work that is already at that floor, and
     # adds a second setup.
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 75
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

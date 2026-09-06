@@ -164,6 +164,17 @@ def _coerce_int(value: Any, default: int) -> int:
         return default
 
 
+def _coerce_provider_failure_cooldown(value: Any) -> int:
+    """Cooldown seconds for provider-failure notices (fork patch P17).
+
+    Default 3600 on missing/malformed input; negatives clamp to 0 (0 disables
+    rate limiting so every failure announces). Never raises — a bad value must
+    not abort gateway config loading.
+    """
+    coerced = _coerce_int(value, 3600)
+    return coerced if coerced > 0 else 0
+
+
 def _coerce_optional_positive_int(value: Any, key: str) -> Optional[int]:
     """Coerce an optional positive integer config value.
 
@@ -1037,6 +1048,23 @@ class GatewayConfig:
     # boxes render this true.
     steer_requires_same_user_mention: bool = False
 
+    # Fork patch P17 (hq/v2): route every user-facing provider/model failure
+    # (billing/credits, auth/key, rate-limit, outage) through one in-voice
+    # composer — a plain first-person line, no emoji, no raw JSON, no vendor
+    # URLs — instead of the stock robotic "⚠️ The model provider failed after
+    # retries…" notices (and the raw billing body that leaked past the pre-P17
+    # detector on 2026-09-04/05). When False (default = stock upstream
+    # behavior, so a dropped patch on a pin bump reverts safely) the stock
+    # notices are used. HQ boxes render this true.
+    provider_failure_voice_enabled: bool = False
+
+    # Fork patch P17: the same provider-failure class is announced at most once
+    # per conversation/thread per this many seconds; later inbound messages in
+    # that state are silent (never two robotic lines back to back, never repeat
+    # spam while the brain is down). <= 0 disables rate limiting. Only consulted
+    # when provider_failure_voice_enabled is true. Default 3600 (one hour).
+    provider_failure_notice_cooldown_seconds: int = 3600
+
     # STT settings
     stt_enabled: bool = True  # Whether to auto-transcribe inbound voice messages
     stt_echo_transcripts: bool = True  # Whether to echo raw STT transcripts back to the user
@@ -1224,6 +1252,8 @@ class GatewayConfig:
             "approval_voice_enabled": self.approval_voice_enabled,
             "system_notices_enabled": self.system_notices_enabled,
             "steer_requires_same_user_mention": self.steer_requires_same_user_mention,
+            "provider_failure_voice_enabled": self.provider_failure_voice_enabled,
+            "provider_failure_notice_cooldown_seconds": self.provider_failure_notice_cooldown_seconds,
             "stt_enabled": self.stt_enabled,
             "stt_echo_transcripts": self.stt_echo_transcripts,
             "group_sessions_per_user": self.group_sessions_per_user,
@@ -1420,6 +1450,12 @@ class GatewayConfig:
             ),
             steer_requires_same_user_mention=_coerce_bool(
                 data.get("steer_requires_same_user_mention"), False
+            ),
+            provider_failure_voice_enabled=_coerce_bool(
+                data.get("provider_failure_voice_enabled"), False
+            ),
+            provider_failure_notice_cooldown_seconds=_coerce_provider_failure_cooldown(
+                data.get("provider_failure_notice_cooldown_seconds")
             ),
             stt_enabled=_coerce_bool(stt_enabled, True),
             stt_echo_transcripts=_coerce_bool(stt_echo_transcripts, True),
@@ -1707,6 +1743,25 @@ def load_gateway_config() -> GatewayConfig:
             elif isinstance(gateway_section, dict) and "steer_requires_same_user_mention" in gateway_section:
                 gw_data["steer_requires_same_user_mention"] = gateway_section[
                     "steer_requires_same_user_mention"
+                ]
+
+            # Fork patch P17: in-voice provider-failure composer gate + cooldown.
+            # Same top-level-wins, nested gateway.* fallback shape.
+            if "provider_failure_voice_enabled" in yaml_cfg:
+                gw_data["provider_failure_voice_enabled"] = yaml_cfg[
+                    "provider_failure_voice_enabled"
+                ]
+            elif isinstance(gateway_section, dict) and "provider_failure_voice_enabled" in gateway_section:
+                gw_data["provider_failure_voice_enabled"] = gateway_section[
+                    "provider_failure_voice_enabled"
+                ]
+            if "provider_failure_notice_cooldown_seconds" in yaml_cfg:
+                gw_data["provider_failure_notice_cooldown_seconds"] = yaml_cfg[
+                    "provider_failure_notice_cooldown_seconds"
+                ]
+            elif isinstance(gateway_section, dict) and "provider_failure_notice_cooldown_seconds" in gateway_section:
+                gw_data["provider_failure_notice_cooldown_seconds"] = gateway_section[
+                    "provider_failure_notice_cooldown_seconds"
                 ]
 
             if "unauthorized_dm_behavior" in yaml_cfg:

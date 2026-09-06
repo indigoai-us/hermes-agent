@@ -733,6 +733,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # owns the @mention send path. Title is read once at first build and the
     # rendered prompt is cached + DB-restored, so this is cache-safe.
     # Gated by config.yaml ``agent.bot_mode_protocol`` (default True).
+    _epoch_stamped = False
     if getattr(agent, "_bot_mode_protocol", True):
         try:
             from tools.bot_mode_probe import (
@@ -759,6 +760,29 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
                     # misinformation.
                     post_workspace_parts.append(epoch_line(_agent_home(agent)))
                     agent._bot_chat_timeless_prompt = True
+                    _epoch_stamped = True
+        except Exception:
+            pass
+
+    # Fork patch P18 (hq/v2): SOUL/persona-change invalidation for ALL sessions.
+    # When ``agent.system_prompt_invalidate_on_soul_change`` is on, stamp the
+    # capability epoch on EVERY built prompt (not just the Bot Chat title) unless
+    # the Bot Chat branch above already stamped it. The restore path in
+    # agent/conversation_loop.py then rebuilds the prompt the next turn after a
+    # SOUL.md (or other capability-surface) change, so an edited persona takes
+    # effect without a restart, /new, or compression. Unlike the Bot Chat stamp,
+    # this does NOT mark the prompt timeless — regular sessions keep their
+    # timestamp line. Default off ⇒ upstream behavior byte-for-byte; unchanged
+    # SOUL hashes identically so the stored bytes are reused verbatim (prefix
+    # cache preserved).
+    if not _epoch_stamped and getattr(
+        agent, "_system_prompt_invalidate_on_soul_change", False
+    ):
+        try:
+            from tools.bot_mode_probe import epoch_line
+
+            post_workspace_parts.append(epoch_line(_agent_home(agent)))
+            _epoch_stamped = True
         except Exception:
             pass
 

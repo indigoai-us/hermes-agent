@@ -22,6 +22,7 @@ and its tests pass.
 | P13 | Gateway | Per-turn system-notice master gate + shared-channel steer gate. | `gateway/run.py`, `gateway/config.py` | `gateway.system_notices_enabled` |
 | P14 | Gateway | Approval prompts speak as a person, fold the raw command, route external channels privately. | `gateway/run.py`, `agent/hq_branding.py` | `gateway.approval_voice_enabled` |
 | P16 | Gateway | Persistent pending clarifies — a clarify request survives a gateway restart and its late reply is routed back to the resumed turn. | `gateway/run.py` | — |
+| P18 | Agent | SOUL/persona-change system-prompt invalidation for ALL sessions. Stock hermes stamps + re-checks the capability epoch only on Bot Chat prompts, so a continuing non-bot session never adopted a SOUL.md edit until a restart / `/new` / compression (a bot kept a stale persona across releases). When on, every built prompt carries the capability-epoch stamp (`capability_fingerprint()` hashes SOUL + skills + toolsets + MCP + roster) and the restore path rebuilds once when it drifts; an ordinary stale session is not re-titled "Bot Chat". Unchanged SOUL hashes identically ⇒ stored bytes reused verbatim (prefix cache preserved). | `agent/agent_init.py`, `agent/system_prompt.py`, `agent/conversation_loop.py` | `agent.system_prompt_invalidate_on_soul_change` (default off; hq-agents-v2 template renders it on) |
 
 ## Tests
 
@@ -33,3 +34,6 @@ and its tests pass.
   new live-adapter code constructs a Web client from a captured token string
   outside the store-bound `_make_web_client` factory — the class of bug P11.1
   fixes. Route every new Slack Web client through `_make_web_client`.
+- P18: `tests/agent/test_system_prompt_soul_invalidation.py`
+  (`uv run pytest tests/agent/test_system_prompt_soul_invalidation.py`) — plus the
+  hq-agents-v2 template render test that pins the flag renders on.

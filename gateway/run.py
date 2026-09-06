@@ -708,6 +708,27 @@ def _gateway_provider_failure_conversation_key(source: Any) -> Optional[str]:
         return None
 
 
+def _result_signals_provider_error(result: Any) -> bool:
+    """True when a turn result carries a provider/runtime failure verdict.
+
+    P17.1: the gateway's in-voice composer must only run when the turn ACTUALLY
+    ended in a provider error, never on a successful reply. The conversation
+    loop stamps ``failed``/``error``/``failure_reason`` (and ``billing_block``
+    for the incident's billing case) on every terminal failure result, so a
+    successful turn (``finish_reason=stop``, real text) has all of them falsy
+    and is never sniffed. Fail-safe to True on an odd/None shape so a genuine
+    failure is never silently passed through un-recomposed.
+    """
+    if not isinstance(result, dict):
+        return True
+    return bool(
+        result.get("failed")
+        or result.get("error")
+        or result.get("failure_reason")
+        or result.get("billing_block")
+    )
+
+
 def _gateway_compose_provider_failure(
     text: str, conversation_key: Optional[str]
 ) -> Optional[str]:
@@ -1202,7 +1223,10 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
 
 
 def _sanitize_gateway_final_response(
-    platform: Any, text: str, conversation_key: Optional[str] = None
+    platform: Any,
+    text: str,
+    conversation_key: Optional[str] = None,
+    turn_had_provider_error: bool = True,
 ) -> str:
     """Sanitize final gateway replies before sending them to chat surfaces.
 
@@ -1240,7 +1264,15 @@ def _sanitize_gateway_final_response(
     # P17: route provider failures through the single in-voice composer (with
     # per-conversation cooldown) when enabled. "" suppresses (a notice already
     # went out to this conversation); a non-None string replaces the raw body.
-    if _gateway_provider_failure_voice_enabled():
+    #
+    # P17.1 guard: only ever run the composer when the turn ACTUALLY ended in a
+    # provider error. A successful turn (finish_reason=stop, real answer) is
+    # never sniffed — so a legitimate reply that merely looks error-shaped
+    # (e.g. a short numeric answer, or prose quoting a status code) can never be
+    # rewritten. Callers that cannot know the turn outcome (status-line path,
+    # direct/legacy callers) default to True and keep the pre-P17.1 behavior;
+    # the two real final-response call sites pass the agent-result verdict.
+    if turn_had_provider_error and _gateway_provider_failure_voice_enabled():
         composed = _gateway_compose_provider_failure(redacted, conversation_key)
         if composed is not None:
             return composed
@@ -7485,6 +7517,8 @@ class TurnRunner:
                 ctx.source.platform,
                 final_response,
                 _gateway_provider_failure_conversation_key(ctx.source),
+                # P17.1: only recompose when the turn actually failed.
+                _result_signals_provider_error(result),
             )
             if not final_response:
                 final_response = f"⚠️ {result['error']}" if result.get("error") else ""
@@ -22907,6 +22941,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     source.platform,
                     response,
                     _gateway_provider_failure_conversation_key(source),
+                    # P17.1: never sniff a successful turn — only recompose when
+                    # the agent result carries a provider-error verdict.
+                    _result_signals_provider_error(agent_result),
                 )
 
             # Ordering contract: the agent thread already updated the contextvar

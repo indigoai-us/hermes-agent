@@ -116,6 +116,75 @@ def test_empty_and_none_are_not_failures():
     assert pfn.classify_failure_text("   ") is None
 
 
+# ── P17.1: short numeric answers must never be seen as an error envelope ──────
+
+# The defect: any reply starting with a 3-digit number + space (e.g. "835
+# files.") matched the bare-code envelope anchor, fell through to CLASS_GENERIC,
+# and the gateway REPLACED the correct answer with the generic "trouble
+# reaching my model brain" line — then a 1h cooldown silenced the follow-ups.
+NUMERIC_ANSWERS_NOT_FAILURES = [
+    "829 files.",
+    "835 files.",
+    "500 widgets.",
+    "404 rows in the export.",
+    "100 items.",
+    "2026 was a good year.",
+    "3 things:",
+    "42",
+    "200 OK responses so far today.",  # even "OK" + a 2xx must not classify
+]
+
+
+@pytest.mark.parametrize("answer", NUMERIC_ANSWERS_NOT_FAILURES)
+def test_short_numeric_answer_is_not_a_failure(answer):
+    assert pfn.classify_failure_text(answer) is None
+    assert pfn.compose_from_text(answer) is None
+
+
+@pytest.mark.parametrize("answer", NUMERIC_ANSWERS_NOT_FAILURES)
+def test_bare_number_never_reaches_generic(answer):
+    # Belt-and-suspenders: the specific class the defect produced was GENERIC.
+    assert pfn.classify_failure_text(answer) != pfn.CLASS_GENERIC
+
+
+def test_no_error_token_fast_path_returns_none():
+    # A body with no error token at all is rejected immediately, whatever shape.
+    for txt in ("just some words", "500 widgets.", "the year 2026", "list: 1 2 3"):
+        assert pfn.classify_failure_text(txt) is None
+
+
+def test_generic_requires_an_explicit_error_token():
+    # Envelope shape ALONE never classifies — an explicit token must co-occur.
+    assert pfn.classify_failure_text("API call failed") == pfn.CLASS_GENERIC  # token: failed
+    # Same leading shape, but no error token anywhere → not a failure.
+    assert pfn.classify_failure_text("API call summary for Q3") is None
+
+
+def test_bare_code_envelope_requires_real_http_error_code_and_token():
+    # 4xx/5xx + status text → classifies; a non-error 3-digit lead does not.
+    assert pfn.classify_failure_text("429 Too Many Requests") == pfn.CLASS_RATE_LIMIT
+    assert pfn.classify_failure_text("503 Service Unavailable") == pfn.CLASS_OUTAGE
+    assert pfn.classify_failure_text("835 Sparkles") is None
+    assert pfn.classify_failure_text("200 OK") is None  # 2xx is not an error code
+
+
+def test_all_real_error_strings_still_classify():
+    # Every real failure body used across this suite must still classify (the
+    # fast path/token floor must not silence real errors).
+    cases = {
+        GROK_BILLING_403: pfn.CLASS_BILLING,
+        GATEWAY_RATE_LIMIT: pfn.CLASS_RATE_LIMIT,
+        GATEWAY_GENERIC: pfn.CLASS_GENERIC,
+        CODEX_NOT_LOGGED_IN: pfn.CLASS_AUTH,
+        OUTAGE: pfn.CLASS_OUTAGE,
+        "API call failed": pfn.CLASS_GENERIC,
+        "402 Payment Required": pfn.CLASS_BILLING,
+        "HTTP 401 Unauthorized": pfn.CLASS_AUTH,
+    }
+    for body, expected in cases.items():
+        assert pfn.classify_failure_text(body) == expected, body
+
+
 # ── Tripwires: forbidden fragments in every composed notice ──────────────────
 
 @pytest.mark.parametrize("fragment", FORBIDDEN_FRAGMENTS)

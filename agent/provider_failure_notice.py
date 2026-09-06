@@ -192,6 +192,38 @@ _OUTAGE_RE = re.compile(
 _BILLING_WEAK_RE = re.compile(r"\b402\b", re.I)
 _AUTH_WEAK_RE = re.compile(r"\b401\b|\bunauthorized\b|\b403\b", re.I)
 
+# ── Explicit error TOKEN (P17.1) ─────────────────────────────────────────────
+# A body with NO error token is NEVER a provider failure, no matter its shape:
+# a short numeric answer like "835 files." / "500 widgets." / "404 rows in the
+# export." must pass straight through untouched. This regex is BOTH the
+# fast-path reject (no token ⇒ return None immediately) and the floor for a
+# GENERIC verdict (an envelope shape ALONE never classifies — an explicit token
+# must co-occur). It is deliberately a superset of every Tier-2 signal plus the
+# HTTP status texts, so a real error string always trips it while a bare number
+# never does.
+_ERROR_TOKEN_RE = re.compile(
+    r"("
+    # HTTP status texts (the words that accompany a real status code)
+    r"too many requests|unauthorized|forbidden|payment required"
+    r"|internal server error|service unavailable|bad gateway|gateway timeout"
+    r"|not found|request timeout|precondition failed"
+    # generic error vocabulary
+    r"|error|failed|failure|exception|traceback|fault|crash"
+    # billing / entitlement
+    r"|limit|quota|credits?|billing|spending|subscription|balance"
+    r"|depleted|insufficient|funds|exhaust"
+    # auth
+    r"|\bauth\b|authentication|unauthenticated|credential|api[\s_-]?key"
+    r"|\btoken\b|logged in|signed in|expired|revoked"
+    # throttling / transport / outage
+    r"|throttl|rate[\s_-]?limit|timeout|timed out|refused|reset"
+    r"|unreachable|overloaded|capacity|not responding|not running"
+    r"|could not connect|cannot connect|connection|no route"
+    r"|network is unreachable|non-retryable|retries|retry"
+    r")",
+    re.I,
+)
+
 # Start-anchored provider-error envelope shape: an optional run of leading
 # non-word/emoji/quote characters, then a marker. Mirrors the pre-P17 gateway
 # ``_GATEWAY_PROVIDER_ERROR_SHAPE_RE`` and adds the weak-class starts so raw
@@ -210,7 +242,8 @@ _ENVELOPE_ANCHORED_RE = re.compile(
     r"|billing or credits exhausted"
     r"|error code\s*:"
     r"|http\s*\d{3}\b"
-    r"|\d{3}\s"  # bare leading status code: "429 Too Many Requests"
+    r"|[45]\d{2}\s"  # bare leading HTTP ERROR code only: "429 " / "503 ".
+    # A real 4xx/5xx, never a plain number like "835 files." (P17.1).
     r"|\{[\"']code[\"']"  # raw JSON error body
     r"|connection\s*(?:error|timeout|refused|reset|aborted)"
     r"|connect\s*(?:error|timeout)"
@@ -249,13 +282,22 @@ def classify_failure_text(text: str) -> Optional[str]:
     if not body:
         return None
 
-    # Tier 1 — definitive, position-independent.
+    # Tier 1 — definitive, position-independent. These phrases essentially
+    # never occur in normal prose, so they classify regardless of shape or the
+    # fast-path token floor below (they inherently carry their own tokens).
     if _BILLING_DEFINITIVE_RE.search(body):
         return CLASS_BILLING
     if _AUTH_DEFINITIVE_RE.search(body):
         return CLASS_AUTH
 
-    # Tier 2 — only inside a short error envelope.
+    # Fast path (P17.1) — a body with NO explicit error token is never a
+    # provider failure. This is what stops a short numeric answer
+    # ("835 files.", "500 widgets.", "404 rows in the export.") from ever being
+    # mistaken for an error envelope and rewritten. Return None immediately.
+    if not _ERROR_TOKEN_RE.search(body):
+        return None
+
+    # Tier 2 — a weak signal only classifies inside a short error envelope.
     if not _looks_like_error_envelope(body):
         return None
     if _BILLING_WEAK_RE.search(body):
@@ -266,6 +308,11 @@ def classify_failure_text(text: str) -> Optional[str]:
         return CLASS_RATE_LIMIT
     if _OUTAGE_RE.search(body):
         return CLASS_OUTAGE
+    # Envelope-shaped, an explicit error token present (guaranteed by the
+    # fast path above), but no specific weak class → GENERIC. NEVER fall
+    # through to GENERIC from an envelope match alone (P17.1): the token floor
+    # is the hard requirement, so a bare "500 " leading a non-error sentence
+    # can never reach here.
     return CLASS_GENERIC
 
 

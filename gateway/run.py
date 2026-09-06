@@ -6544,12 +6544,26 @@ class TurnRunner:
                 return ""
 
             clarify_id = _uuid.uuid4().hex[:10]
+            # P16: capture routing so a persisted clarify can be delivered back
+            # to the originating thread after a gateway restart. Best-effort —
+            # a serialization hiccup must never break the live clarify path.
+            _clarify_routing = None
+            _clarify_platform = None
+            try:
+                if getattr(ctx, "source", None) is not None:
+                    _clarify_routing = ctx.source.to_dict()
+                    _clarify_platform = getattr(ctx.source.platform, "value", None)
+            except Exception:
+                _clarify_routing = None
+                _clarify_platform = None
             _clarify_mod.register(
                 clarify_id=clarify_id,
                 session_key=ctx.session_key or "",
                 question=question,
                 choices=list(choices) if choices else None,
                 multi_select=bool(multi_select),
+                routing=_clarify_routing,
+                platform=_clarify_platform,
             )
 
             # For WeCom native streaming: finalize the current stream before
@@ -13659,6 +13673,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("Startup watchdog disarm failed", exc_info=True)
         logger.info("Session storage: %s", self.config.sessions_dir)
 
+        # P16: rehydrate persisted pending clarifies and register the resumed-
+        # turn dispatcher so a reply that arrives after a restart still matches
+        # its question and continues the conversation. Flag-gated inside the
+        # module (agent.clarify_persist, default OFF in the fork) — a no-op when
+        # disabled. Best-effort: a restore failure must never abort startup, and
+        # it deliberately emits ZERO outbound text (no lifecycle banners).
+        try:
+            from tools import clarify_gateway as _clarify_restore_mod
+            _clarify_restore_mod.set_resume_dispatcher(
+                self._dispatch_restored_clarify_turn
+            )
+            _restored_clarifies = _clarify_restore_mod.restore_pending()
+            if _restored_clarifies:
+                logger.info(
+                    "Rehydrated %d pending clarify entr%s at gateway start",
+                    _restored_clarifies,
+                    "y" if _restored_clarifies == 1 else "ies",
+                )
+        except Exception:
+            logger.debug("Pending-clarify restore failed", exc_info=True)
+
         # Sanity-check that systemd's TimeoutStopSec covers our drain
         # window.  When the user upgraded hermes-agent without re-running
         # ``hermes setup``, their unit file may still encode the old
@@ -18221,6 +18256,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._handle_loop_command(event)
         return "Agent is running — use /loop status / pause / stop mid-run, or /stop before setting a new loop."
 
+    def _dispatch_restored_clarify_turn(self, entry, seed: str) -> None:
+        """Submit a fresh agent turn for a restored clarify's late reply (P16).
+
+        Called synchronously by ``clarify_gateway.attempt_text_response_for_session``
+        from within ``_handle_message`` (the gateway event loop) when the reply
+        matched a RESTORED entry. The original waiter thread died with the prior
+        process, so there is nothing to unblock — instead we reconstruct the
+        originating ``SessionSource`` from the persisted routing and schedule a
+        synthetic turn seeded with the original question + the answer.
+
+        Marked ``internal=True``: the live reply that triggered this dispatch has
+        already passed the inbound authorization gate for this session, and the
+        seed is agent input, not a fresh user utterance. Emits ZERO outbound
+        lifecycle banner (policy
+        indigo-fleet-agents-never-broadcast-runtime-lifecycle-messages).
+        """
+        loop = getattr(self, "_gateway_loop", None)
+        if loop is None:
+            logger.warning(
+                "No gateway loop to dispatch restored clarify %s",
+                getattr(entry, "clarify_id", "?"),
+            )
+            return
+        try:
+            routing = getattr(entry, "routing", None) or {}
+            source = SessionSource.from_dict(routing)
+        except Exception:
+            logger.warning(
+                "Could not rebuild source for restored clarify %s; dropping",
+                getattr(entry, "clarify_id", "?"),
+                exc_info=True,
+            )
+            return
+        synthetic_event = MessageEvent(
+            text=seed,
+            source=source,
+            internal=True,
+        )
+
+        async def _run_restored_turn():
+            try:
+                await self._handle_message(synthetic_event)
+            except Exception:
+                logger.warning(
+                    "Restored clarify turn failed for %s",
+                    getattr(entry, "clarify_id", "?"),
+                    exc_info=True,
+                )
+
+        try:
+            asyncio.run_coroutine_threadsafe(_run_restored_turn(), loop)
+        except Exception:
+            logger.warning(
+                "Could not schedule restored clarify turn for %s",
+                getattr(entry, "clarify_id", "?"),
+                exc_info=True,
+            )
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -18643,6 +18736,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Acknowledge with empty string so adapters that emit
                     # the agent's response don't double-post.  The agent
                     # itself will produce the next user-facing message.
+                    return ""
+                if _text_outcome == _clarify_mod.TEXT_RESUMED:
+                    # P16: reply matched a RESTORED clarify (rehydrated from
+                    # disk after a gateway restart). The original waiter thread
+                    # is gone, so the module already dispatched a fresh agent
+                    # turn seeded with the original question + this answer via
+                    # the registered resume dispatcher, and deleted the file.
+                    # Emit ZERO outbound banner (policy
+                    # indigo-fleet-agents-never-broadcast-runtime-lifecycle-messages);
+                    # the resumed turn produces the next user-facing message.
+                    logger.info(
+                        "Gateway resumed restored clarify from late reply "
+                        "(session=%s, id=%s)",
+                        _quick_key, _pending_clarify.clarify_id,
+                    )
                     return ""
                 if _text_outcome == _clarify_mod.TEXT_REJECTED_SELECTION:
                     # Selection-shaped but invalid (out-of-range number,

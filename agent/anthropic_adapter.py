@@ -517,6 +517,48 @@ _CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for 
 _MCP_TOOL_PREFIX = "mcp__"
 
 
+def _oauth_identity_reassert_block(
+    system: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Re-assert the agent's own identity as the LAST OAuth system block.
+
+    Fork patch (hq/v2): on the OAuth path the Claude Code prefix is prepended as
+    the FIRST system block ("You are Claude Code, Anthropic's official CLI for
+    Claude."), which overshadowed the agent's fleet identity carried in the SOUL
+    block (system[1]). A claude-brain fleet agent adopted the WRONG name on its
+    very first turn — Linus answered "I'm Cherlie…" (2026-09-05) — while
+    codex/grok agents (no Claude Code prefix on their wire) honored the same
+    SOUL. The identity IS present, just demoted; re-stating it as the last block
+    (recency) makes the agent's own name authoritative for user-facing behavior
+    WITHOUT removing the Claude Code prefix the OAuth billing path requires.
+
+    Returns a new text block, or None when there is no distinct fleet identity
+    to protect (the sanitized default identity already reads as Claude Code).
+    """
+    for block in system:
+        if not (isinstance(block, dict) and block.get("type") == "text"):
+            continue
+        text = (block.get("text") or "").lstrip()
+        if text == _CLAUDE_CODE_SYSTEM_PREFIX:
+            continue  # the Claude Code prefix, not the agent's identity
+        first_line = text.split("\n", 1)[0].strip()
+        if not first_line.startswith("You are "):
+            continue
+        if "Claude Code" in first_line:
+            return None  # sanitized default identity — nothing distinct to guard
+        return {
+            "type": "text",
+            "text": (
+                f"{first_line}\n"
+                "That is your identity in this environment and it is "
+                "authoritative: when asked who you are or what your name is, "
+                'answer as that agent — never as "Claude Code" or any other '
+                "name."
+            ),
+        }
+    return None
+
+
 def _get_claude_code_version() -> str:
     """Lazily detect the installed Claude Code version when OAuth headers need it."""
     global _claude_code_version_cache
@@ -937,6 +979,14 @@ def build_anthropic_kwargs(
                 text = text.replace("hermes-agent", "claude-code")
                 text = text.replace("Nous Research", "Anthropic")
                 block["text"] = text
+
+        # 2b. Re-assert the agent's own identity as the LAST system block so the
+        #     Claude Code prefix in system[0] does not overshadow it (a fleet
+        #     agent answered with the wrong name on its first turn, 2026-09-05).
+        #     Runs after sanitization so the reasserted line is already clean.
+        _identity_block = _oauth_identity_reassert_block(system)
+        if _identity_block is not None:
+            system.append(_identity_block)
 
         # 3. Normalize tool names so NOTHING goes on the OAuth wire with a
         #    single-underscore ``mcp_`` prefix.  Anthropic's subscription/OAuth

@@ -505,3 +505,31 @@ def test_notice_phrases_still_present_in_canonical_module():
     assert "gateway/run.py" in _files_containing(_REDIRECT)
     assert "agent/background_review.py" in _files_containing(_SELF_IMPROVE)
     assert "agent/onboarding.py" in _files_containing(_FIRST_TIP)
+
+
+def test_no_home_channel_notice_is_gated_by_system_notices():
+    """Fork patch P13: the "No home channel is set …" prompt is an unprompted
+    per-turn system notice — it must be suppressed when system notices are off.
+    It leaked into a fleet agent's very FIRST HQ DM on 2026-09-05
+    ("📬 No home channel is set for Hqdm … Type /sethome …"), the same class of
+    chatter P13 already gates for busy acks and first-time tips. This is a
+    source-level guard because the emission lives deep in the inbound handler.
+    """
+    from pathlib import Path
+
+    run_py = Path(__file__).resolve().parents[2] / "gateway" / "run.py"
+    lines = run_py.read_text(encoding="utf-8").splitlines()
+    notice_idx = next(
+        i for i, line in enumerate(lines) if "No home channel is set for" in line
+    )
+    # The nearest `if not home_env` above the notice is the delivery guard.
+    guard = next(
+        lines[j]
+        for j in range(notice_idx, max(0, notice_idx - 25), -1)
+        if "if not home_env" in lines[j]
+    )
+    assert "_system_notices_enabled()" in guard, (
+        "the no-home-channel notice delivery must be gated behind "
+        "self._system_notices_enabled() (fork patch P13); found guard: "
+        f"{guard.strip()!r}"
+    )

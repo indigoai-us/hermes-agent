@@ -22411,7 +22411,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             home_env = "set"
                 except Exception:
                     pass
-            if not home_env:
+            # Fork patch P13: the "no home channel is set" prompt is an
+            # unprompted per-turn system notice — suppress it when system
+            # notices are disabled (HQ fleet boxes). It leaked into a fleet
+            # agent's very first HQ DM on 2026-09-05 ("📬 No home channel is
+            # set for Hqdm … Type /sethome …"), the same class of chatter P13
+            # gates for busy acks and first-time tips.
+            if not home_env and self._system_notices_enabled():
                 # Slack dispatches all Hermes commands through a single
                 # parent slash command `/hermes`; bare `/sethome` is not
                 # registered and would fail with "app did not respond".

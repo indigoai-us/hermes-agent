@@ -31,11 +31,13 @@ Two delivery paths from the adapter:
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +57,19 @@ class _ClarifyEntry:
     event: threading.Event = field(default_factory=threading.Event)
     response: Optional[str] = None
     awaiting_text: bool = False  # set when user picked "Other" or clarify is open-ended
+    # --- P16 persistence fields -------------------------------------------
+    # ``created_at`` is stamped at register time so a restored entry keeps its
+    # original age. ``routing`` is the serialized ``SessionSource`` (see
+    # ``SessionSource.to_dict``) needed to deliver the resumed turn back to the
+    # originating platform/thread. ``platform`` is a convenience mirror of the
+    # routing platform for logging/inspection. ``restored`` marks an entry
+    # rehydrated from disk at gateway start: it has NO live waiter thread
+    # (the original ``wait_for_response`` died with the previous process), so a
+    # late reply must dispatch a FRESH agent turn instead of setting the event.
+    created_at: float = field(default_factory=time.time)
+    routing: Optional[Dict[str, Any]] = None
+    platform: Optional[str] = None
+    restored: bool = False
 
     def signature(self) -> Dict[str, object]:
         return {
@@ -74,6 +89,150 @@ _session_index: Dict[str, List[str]] = {}
 
 
 # =========================================================================
+# P16 — persistent pending clarifies (disk store)
+# =========================================================================
+#
+# A clarify prompt lives only in the module-level ``_entries`` map, so a
+# gateway restart while a user is mid-decision loses the pending question and
+# the user's eventual reply lands as an unrelated follow-up turn. P16 mirrors
+# each pending clarify to ``<HERMES_HOME>/clarify-pending/<clarify_id>.json``
+# (write-through on register, delete on resolve/timeout/clear) and rehydrates
+# them at gateway start as ``restored`` entries so a late reply still matches.
+#
+# Flag-gated: OFF by default in the fork (P-convention). The HQ config template
+# turns it on. Persistence is a no-op when disabled — the in-process behavior
+# is byte-for-byte unchanged.
+
+_PENDING_DIRNAME = "clarify-pending"
+
+
+def _persist_enabled() -> bool:
+    """Return True when ``agent.clarify_persist`` is enabled in config.
+
+    Default OFF in the fork. Any error resolving config → OFF (fail-closed to
+    the pre-P16 in-process-only behavior). Kept as a standalone function so
+    tests can monkeypatch it deterministically without a config.yaml on disk.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        return bool((cfg.get("agent") or {}).get("clarify_persist", False))
+    except Exception:
+        return False
+
+
+def _pending_dir() -> Path:
+    """Return the on-disk directory holding persisted pending clarifies."""
+    from hermes_cli.config import get_hermes_home
+    return get_hermes_home() / _PENDING_DIRNAME
+
+
+def _persist_path(clarify_id: str) -> Path:
+    return _pending_dir() / f"{clarify_id}.json"
+
+
+def _entry_to_disk(entry: _ClarifyEntry) -> Dict[str, Any]:
+    """Serialize an entry to the JSON payload written to disk.
+
+    The live ``threading.Event``/``response`` are intentionally NOT persisted —
+    a restored entry starts with a fresh (unset) event and no waiter.
+    """
+    return {
+        "clarify_id": entry.clarify_id,
+        "session_key": entry.session_key,
+        "question": entry.question,
+        "choices": list(entry.choices) if entry.choices else None,
+        "multi_select": bool(entry.multi_select),
+        "awaiting_text": bool(entry.awaiting_text),
+        "created_at": float(entry.created_at),
+        "routing": entry.routing,
+        "platform": entry.platform,
+    }
+
+
+def _persist_entry(entry: _ClarifyEntry) -> None:
+    """Write-through an entry to disk (atomic rename). No-op when disabled."""
+    if not _persist_enabled():
+        return
+    try:
+        directory = _pending_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        path = _persist_path(entry.clarify_id)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps(_entry_to_disk(entry), ensure_ascii=False),
+            encoding="utf-8",
+        )
+        tmp.replace(path)
+    except Exception:
+        # Persistence is best-effort: a disk failure must never break the live
+        # clarify path (the in-process entry is already registered).
+        logger.debug("Failed to persist pending clarify %s", entry.clarify_id, exc_info=True)
+
+
+def _delete_persisted(clarify_id: str) -> None:
+    """Remove a persisted clarify file. Safe to call when disabled / absent."""
+    try:
+        _persist_path(clarify_id).unlink(missing_ok=True)
+    except Exception:
+        logger.debug("Failed to delete persisted clarify %s", clarify_id, exc_info=True)
+
+
+def restore_pending() -> int:
+    """Rehydrate persisted pending clarifies into module state at gateway start.
+
+    Each file becomes a ``restored=True`` entry with a FRESH (unset) event and
+    NO waiter thread — the original waiter died with the previous process. The
+    entry is added to ``_entries``/``_session_index`` so
+    ``get_pending_for_session`` / ``attempt_text_response_for_session`` still
+    match a late reply; a matched restored entry dispatches a fresh agent turn
+    (see ``attempt_text_response_for_session``) rather than setting the event.
+
+    Emits ZERO outbound text — no notify callbacks, no user-facing banners
+    (policy ``indigo-fleet-agents-never-broadcast-runtime-lifecycle-messages``).
+    Returns the number of entries restored. No-op when disabled.
+    """
+    if not _persist_enabled():
+        return 0
+    directory = _pending_dir()
+    if not directory.is_dir():
+        return 0
+    restored = 0
+    for path in sorted(directory.glob("*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.debug("Skipping unreadable pending clarify %s", path, exc_info=True)
+            continue
+        cid = data.get("clarify_id")
+        session_key = data.get("session_key")
+        if not cid or not session_key:
+            continue
+        entry = _ClarifyEntry(
+            clarify_id=cid,
+            session_key=session_key,
+            question=data.get("question") or "",
+            choices=list(data["choices"]) if data.get("choices") else None,
+            multi_select=bool(data.get("multi_select")),
+            awaiting_text=bool(data.get("awaiting_text")),
+            created_at=float(data.get("created_at") or time.time()),
+            routing=data.get("routing"),
+            platform=data.get("platform"),
+            restored=True,
+        )
+        with _lock:
+            _entries[cid] = entry
+            ids = _session_index.setdefault(session_key, [])
+            if cid not in ids:
+                ids.append(cid)
+        restored += 1
+    if restored:
+        logger.info("Restored %d pending clarify entr%s from disk",
+                    restored, "y" if restored == 1 else "ies")
+    return restored
+
+
+# =========================================================================
 # Public API — agent-thread side
 # =========================================================================
 
@@ -83,11 +242,19 @@ def register(
     question: str,
     choices: Optional[List[str]],
     multi_select: bool = False,
+    *,
+    routing: Optional[Dict[str, Any]] = None,
+    platform: Optional[str] = None,
 ) -> _ClarifyEntry:
     """Register a pending clarify request and return the entry.
 
     The caller (gateway clarify_callback) will then send the prompt to the
     user and block on ``wait_for_response(clarify_id, timeout)``.
+
+    ``routing`` (a serialized ``SessionSource``) and ``platform`` are stored so
+    a persisted entry can be delivered back to the originating thread after a
+    restart. They are only meaningful when ``agent.clarify_persist`` is on;
+    when it is off the values are still held in memory but never written.
     """
     entry = _ClarifyEntry(
         clarify_id=clarify_id,
@@ -97,10 +264,15 @@ def register(
         multi_select=bool(multi_select) and bool(choices),
         # Open-ended (no choices) → next message IS the response, no buttons needed.
         awaiting_text=not bool(choices),
+        routing=routing,
+        platform=platform,
     )
     with _lock:
         _entries[clarify_id] = entry
         _session_index.setdefault(session_key, []).append(clarify_id)
+    # Write-through AFTER the in-memory registration so the live path is never
+    # gated on disk I/O.
+    _persist_entry(entry)
     return entry
 
 
@@ -154,6 +326,11 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
             if not ids:
                 _session_index.pop(entry.session_key, None)
 
+    # Timeout cleanup: the waiter is leaving whether it was resolved (file
+    # already deleted by resolve_gateway_clarify) or it timed out. Delete the
+    # persisted file so a timed-out prompt is not resurrected on next restart.
+    _delete_persisted(clarify_id)
+
     return entry.response
 
 
@@ -173,7 +350,11 @@ def resolve_gateway_clarify(clarify_id: str, response: str) -> bool:
             return False
         entry.response = str(response) if response is not None else ""
         entry.event.set()
-        return True
+    # Delete on resolve: the prompt has been answered, so it must not survive a
+    # restart. Done outside the lock (disk I/O) — the waiter's own cleanup also
+    # deletes, and unlink(missing_ok=True) makes the double-delete harmless.
+    _delete_persisted(clarify_id)
+    return True
 
 
 def get_pending_for_session(
@@ -221,6 +402,61 @@ TEXT_RESOLVED = "resolved"
 TEXT_REJECTED_PROSE = "rejected_prose"
 TEXT_REJECTED_SELECTION = "rejected_selection"
 TEXT_NO_PENDING = "no_pending"
+# P16: a reply matched a RESTORED entry (rehydrated from disk after a restart).
+# There is no live waiter to unblock, so the reply was accepted by dispatching a
+# fresh agent turn seeded with the original question + the answer.
+TEXT_RESUMED = "resumed"
+
+
+# =========================================================================
+# P16 — resumed-turn dispatch (gateway → agent bridge)
+# =========================================================================
+# The gateway registers a single process-wide dispatcher at start. When a late
+# reply matches a restored entry, the module invokes it with (entry, seed) so
+# the gateway can submit a FRESH agent turn (the original waiter thread is dead).
+# Kept as an injectable hook so the module stays decoupled from gateway types
+# and tests can assert the dispatcher receives the seeded content.
+
+_resume_dispatcher: Optional[Callable[["_ClarifyEntry", str], None]] = None
+
+
+def set_resume_dispatcher(cb: Optional[Callable[["_ClarifyEntry", str], None]]) -> None:
+    """Register (or clear, with ``None``) the resumed-turn dispatcher."""
+    global _resume_dispatcher
+    _resume_dispatcher = cb
+
+
+def build_resume_seed(entry: _ClarifyEntry, answer: str) -> str:
+    """Build the seed content for a resumed agent turn.
+
+    Contains ONLY the original question and the user's answer — deliberately no
+    "restored"/"resuming"/"gateway" lifecycle language (this is agent input, and
+    the tripwire policy forbids broadcasting runtime lifecycle chatter). The
+    agent treats it as the answer to a question it previously asked and continues
+    naturally.
+    """
+    question = (entry.question or "").strip()
+    reply = (answer or "").strip()
+    if question:
+        return f"Earlier you asked: {question}\n\nMy answer: {reply}"
+    return reply
+
+
+def _dispatch_resumed_turn(entry: _ClarifyEntry, answer: str) -> None:
+    """Invoke the registered dispatcher with the seeded content (best-effort)."""
+    cb = _resume_dispatcher
+    if cb is None:
+        logger.warning(
+            "No resume dispatcher registered; dropping resumed clarify %s",
+            entry.clarify_id,
+        )
+        return
+    try:
+        cb(entry, build_resume_seed(entry, answer))
+    except Exception:
+        logger.warning(
+            "Resume dispatcher failed for clarify %s", entry.clarify_id, exc_info=True,
+        )
 
 
 def _selection_attempt_tokens(
@@ -446,6 +682,21 @@ def attempt_text_response_for_session(session_key: str, response: str) -> str:
             return TEXT_REJECTED_SELECTION
         return TEXT_REJECTED_PROSE
 
+    if entry.restored:
+        # No live waiter — the original process (and its wait_for_response
+        # thread) is gone. Dispatch a fresh agent turn seeded with the
+        # original question + this answer, then drop the entry and its file.
+        with _lock:
+            _entries.pop(entry.clarify_id, None)
+            ids = _session_index.get(entry.session_key)
+            if ids and entry.clarify_id in ids:
+                ids.remove(entry.clarify_id)
+                if not ids:
+                    _session_index.pop(entry.session_key, None)
+        _dispatch_resumed_turn(entry, coerced)
+        _delete_persisted(entry.clarify_id)
+        return TEXT_RESUMED
+
     if resolve_gateway_clarify(entry.clarify_id, coerced):
         return TEXT_RESOLVED
     # Lost a race with a button/callback resolution — treat as no work left.
@@ -521,6 +772,11 @@ def clear_session(session_key: str) -> int:
             entry.response = ""
             entry.event.set()
             cancelled += 1
+    # Drop every persisted file for this session — a cleared session (/new,
+    # shutdown, eviction) must not be resurrected from disk on restart. This
+    # covers restored entries too (no waiter to run wait_for_response cleanup).
+    for cid in ids:
+        _delete_persisted(cid)
     return cancelled
 
 

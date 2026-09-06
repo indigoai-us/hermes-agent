@@ -460,3 +460,251 @@ class TestNativeRejectClassification:
         )
         assert value is None
         assert reason == "prose"
+
+
+# =========================================================================
+# P16 — persistent pending clarifies (disk store, restore, resumed dispatch)
+# =========================================================================
+
+
+def _clear_clarify_state_full():
+    """Reset module state AND the P16 resume dispatcher between tests."""
+    from tools import clarify_gateway as cm
+    with cm._lock:
+        cm._entries.clear()
+        cm._session_index.clear()
+        cm._notify_cbs.clear()
+    cm.set_resume_dispatcher(None)
+
+
+class TestClarifyPersistence:
+    """P16: write-through persistence + delete lifecycle.
+
+    Persistence is flag-gated (agent.clarify_persist, default OFF). The
+    conftest sandboxes HERMES_HOME to a per-test tempdir, so the on-disk
+    store lands there. Each test force-enables the flag via monkeypatch so it
+    exercises the persisted path deterministically without a config.yaml.
+    """
+
+    def setup_method(self):
+        _clear_clarify_state_full()
+
+    def _enable(self, monkeypatch):
+        from tools import clarify_gateway as cm
+        monkeypatch.setattr(cm, "_persist_enabled", lambda: True)
+        return cm
+
+    def test_register_writes_through_to_disk(self, monkeypatch):
+        cm = self._enable(monkeypatch)
+        cm.register(
+            "p-reg", "sk-p", "Deploy where?", ["staging", "prod"],
+            routing={"platform": "slack", "chat_id": "C1"},
+            platform="slack",
+        )
+        path = cm._persist_path("p-reg")
+        assert path.exists()
+        import json
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["clarify_id"] == "p-reg"
+        assert data["session_key"] == "sk-p"
+        assert data["question"] == "Deploy where?"
+        assert data["choices"] == ["staging", "prod"]
+        assert data["routing"] == {"platform": "slack", "chat_id": "C1"}
+        assert data["platform"] == "slack"
+        assert "created_at" in data
+
+    def test_disabled_flag_writes_nothing(self, monkeypatch):
+        from tools import clarify_gateway as cm
+        # Default OFF (no monkeypatch): nothing should hit disk.
+        cm.register("p-off", "sk-off", "Q?", ["A"])
+        assert not cm._persist_path("p-off").exists()
+        assert not cm._pending_dir().exists()
+
+    def test_delete_on_resolve(self, monkeypatch):
+        cm = self._enable(monkeypatch)
+        cm.register("p-res", "sk-r", "Q?", ["A", "B"])
+        assert cm._persist_path("p-res").exists()
+        assert cm.resolve_gateway_clarify("p-res", "A") is True
+        assert not cm._persist_path("p-res").exists()
+
+    def test_delete_on_timeout(self, monkeypatch):
+        cm = self._enable(monkeypatch)
+        cm.register("p-to", "sk-to", "Q?", None)  # open-ended, no waiter resolves
+        assert cm._persist_path("p-to").exists()
+        # Short timeout, never resolved → wait_for_response cleans the file up.
+        result = cm.wait_for_response("p-to", timeout=0.05)
+        assert result is None
+        assert not cm._persist_path("p-to").exists()
+
+    def test_delete_on_clear_session(self, monkeypatch):
+        cm = self._enable(monkeypatch)
+        cm.register("p-c1", "sk-clear", "Q1?", None)
+        cm.register("p-c2", "sk-clear", "Q2?", ["A"])
+        assert cm._persist_path("p-c1").exists()
+        assert cm._persist_path("p-c2").exists()
+        cm.clear_session("sk-clear")
+        assert not cm._persist_path("p-c1").exists()
+        assert not cm._persist_path("p-c2").exists()
+
+
+class TestClarifyRestore:
+    """P16: restore_pending rehydration + resumed-turn dispatch."""
+
+    def setup_method(self):
+        _clear_clarify_state_full()
+
+    def _enable(self, monkeypatch):
+        from tools import clarify_gateway as cm
+        monkeypatch.setattr(cm, "_persist_enabled", lambda: True)
+        return cm
+
+    def _simulate_restart(self, cm):
+        """Drop in-memory state (as a fresh process would) but keep disk files."""
+        with cm._lock:
+            cm._entries.clear()
+            cm._session_index.clear()
+
+    def test_restore_loads_entries_as_restored(self, monkeypatch):
+        cm = self._enable(monkeypatch)
+        cm.register(
+            "r1", "sk-restore", "Pick region", ["us", "eu"],
+            routing={"platform": "slack", "chat_id": "C7"}, platform="slack",
+        )
+        self._simulate_restart(cm)
+        # After "restart" the entry is only on disk.
+        assert cm.get_pending_for_session("sk-restore") is None
+        n = cm.restore_pending()
+        assert n == 1
+        entry = cm.get_pending_for_session(
+            "sk-restore", include_choice_prompts=True,
+        )
+        assert entry is not None
+        assert entry.restored is True
+        assert entry.question == "Pick region"
+        assert entry.choices == ["us", "eu"]
+        assert entry.routing == {"platform": "slack", "chat_id": "C7"}
+        # No waiter thread: the event must be unset.
+        assert entry.event.is_set() is False
+
+    def test_restore_then_match_dispatches_resumed_turn(self, monkeypatch):
+        cm = self._enable(monkeypatch)
+        cm.register(
+            "r2", "sk-match", "Deploy where?", ["staging", "prod"],
+            routing={"platform": "slack", "chat_id": "C9"}, platform="slack",
+        )
+        self._simulate_restart(cm)
+        cm.restore_pending()
+
+        captured = []
+        cm.set_resume_dispatcher(lambda entry, seed: captured.append((entry, seed)))
+
+        outcome = cm.attempt_text_response_for_session("sk-match", "prod")
+        assert outcome == cm.TEXT_RESUMED
+        assert len(captured) == 1
+        dispatched_entry, seed = captured[0]
+        assert dispatched_entry.clarify_id == "r2"
+        # Seed carries the original question and the coerced answer.
+        assert "Deploy where?" in seed
+        assert "prod" in seed
+        # Entry + file are gone after a successful resume.
+        assert cm.get_pending_for_session("sk-match", include_choice_prompts=True) is None
+        assert not cm._persist_path("r2").exists()
+
+    def test_restore_numeric_reply_coerces_to_choice_in_seed(self, monkeypatch):
+        cm = self._enable(monkeypatch)
+        cm.register(
+            "r3", "sk-num", "Pick one", ["alpha", "beta", "gamma"],
+            routing={"platform": "telegram", "chat_id": "42"},
+        )
+        self._simulate_restart(cm)
+        cm.restore_pending()
+        captured = []
+        cm.set_resume_dispatcher(lambda entry, seed: captured.append(seed))
+        assert cm.attempt_text_response_for_session("sk-num", "2") == cm.TEXT_RESUMED
+        assert "beta" in captured[0]
+
+    def test_restore_invalid_selection_keeps_entry_armed(self, monkeypatch):
+        cm = self._enable(monkeypatch)
+        cm.register("r4", "sk-armed", "Pick one", ["A", "B"])
+        self._simulate_restart(cm)
+        cm.restore_pending()
+        captured = []
+        cm.set_resume_dispatcher(lambda entry, seed: captured.append(seed))
+        # Out-of-range selection → armed retry, no dispatch, file survives.
+        assert cm.attempt_text_response_for_session("sk-armed", "9") == (
+            cm.TEXT_REJECTED_SELECTION
+        )
+        assert captured == []
+        assert cm.get_pending_for_session(
+            "sk-armed", include_choice_prompts=True,
+        ) is not None
+        assert cm._persist_path("r4").exists()
+
+
+class TestClarifyRestoreTripwire:
+    """P16 hard tripwire: restore/resume emit ZERO outbound lifecycle chatter.
+
+    Policy indigo-fleet-agents-never-broadcast-runtime-lifecycle-messages
+    forbids the fleet agent from telling the user things like "restored",
+    "resuming", or "gateway restarted". Restore must be silent (no notify
+    callback fired) and the resumed seed must carry no lifecycle banner words.
+    """
+
+    _BANNED = ("restored", "restoring", "resuming", "resumed", "gateway", "restart")
+
+    def setup_method(self):
+        _clear_clarify_state_full()
+
+    def _enable(self, monkeypatch):
+        from tools import clarify_gateway as cm
+        monkeypatch.setattr(cm, "_persist_enabled", lambda: True)
+        return cm
+
+    def test_restore_fires_no_notify_callback(self, monkeypatch):
+        cm = self._enable(monkeypatch)
+        cm.register(
+            "t1", "sk-silent", "Pick", ["A", "B"],
+            routing={"platform": "slack", "chat_id": "C1"},
+        )
+        with cm._lock:
+            cm._entries.clear()
+            cm._session_index.clear()
+
+        sent = []
+        cm.register_notify("sk-silent", lambda entry: sent.append(entry))
+        n = cm.restore_pending()
+        assert n == 1
+        # restore_pending must NOT push any prompt/banner to the adapter.
+        assert sent == []
+
+    def test_resumed_seed_has_no_lifecycle_banner(self, monkeypatch):
+        cm = self._enable(monkeypatch)
+        cm.register(
+            "t2", "sk-seed", "Which environment should I target?",
+            ["staging", "prod"],
+            routing={"platform": "slack", "chat_id": "C1"},
+        )
+        with cm._lock:
+            cm._entries.clear()
+            cm._session_index.clear()
+        cm.restore_pending()
+        captured = []
+        cm.set_resume_dispatcher(lambda entry, seed: captured.append(seed))
+        cm.attempt_text_response_for_session("sk-seed", "prod")
+        assert len(captured) == 1
+        seed_lower = captured[0].lower()
+        for word in self._BANNED:
+            assert word not in seed_lower, f"seed leaked banner word: {word!r}"
+
+    def test_build_resume_seed_is_clean(self):
+        from tools import clarify_gateway as cm
+        entry = cm._ClarifyEntry(
+            clarify_id="t3", session_key="sk", question="Pick a color?",
+            choices=["red", "blue"],
+        )
+        seed = cm.build_resume_seed(entry, "blue")
+        seed_lower = seed.lower()
+        for word in self._BANNED:
+            assert word not in seed_lower
+        assert "blue" in seed
+        assert "Pick a color?" in seed

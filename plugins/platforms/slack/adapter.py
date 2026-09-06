@@ -8199,18 +8199,59 @@ class SlackAdapter(BasePlatformAdapter):
                 self._approval_voice_markers, self._APPROVAL_RESOLVED_MAX
             )
 
-        # Fold the raw (already redacted) command into a threaded details reply
-        # — never in the ask body. Reply under the ask message so the approver
-        # can expand it; on failure the ask still stands.
+        # Fork patch P14.2: the raw (already redacted) command NEVER goes to a
+        # channel — not even folded in a thread under the ask. On a shared /
+        # customer channel a threaded "details:" reply is still posted in the
+        # channel and every member (including externals) can expand it; that is
+        # exactly the leak seen on 2026-09 (lilo-social/Stitch), where the
+        # python3 -c env-dump command rendered inline under the ask. The
+        # command goes ONLY to a private DM with the requester (or the
+        # configured owner), or nowhere if no private target can be resolved.
+        # The ask + buttons already stand on their own; the details DM is a
+        # best-effort convenience for the approver.
         if msg_ts:
-            try:
-                await self._get_client(target, team_id=team_id).chat_postMessage(
-                    channel=target,
-                    thread_ts=msg_ts,
-                    text=hq_branding.approval_details_block(command),
+            details_target: Optional[str] = None
+            details_thread_ts: Optional[str] = None
+            if routed_private:
+                # ``target`` is already the requester's DM; fold under the ask.
+                details_target = target
+                details_thread_ts = msg_ts
+            else:
+                # Internal channel: the ask posted in-channel, but the command
+                # must still be private. Open a DM to the requester (or owner).
+                extra_cfg = (
+                    self.config.extra if isinstance(self.config.extra, dict) else {}
                 )
-            except Exception as e:
-                logger.debug("[Slack] approval details reply failed: %s", e)
+                owner_dm_user = requester_id or str(
+                    extra_cfg.get("approval_owner") or ""
+                )
+                if owner_dm_user:
+                    try:
+                        details_target = await self._ensure_dm_conversation(
+                            owner_dm_user, team_id=team_id
+                        )
+                    except Exception as e:
+                        logger.debug(
+                            "[Slack] could not open approval details DM: %s", e
+                        )
+                        details_target = None
+            if details_target:
+                try:
+                    await self._get_client(
+                        details_target, team_id=team_id
+                    ).chat_postMessage(
+                        channel=details_target,
+                        thread_ts=details_thread_ts,
+                        text=hq_branding.approval_details_block(command),
+                    )
+                except Exception as e:
+                    logger.debug("[Slack] approval details reply failed: %s", e)
+            else:
+                logger.info(
+                    "[Slack] approval details withheld from channel %s "
+                    "(no private target); command not posted",
+                    chat_id,
+                )
 
         return SendResult(success=True, message_id=msg_ts, raw_response=result)
 

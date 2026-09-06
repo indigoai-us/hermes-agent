@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from functools import lru_cache
 from typing import Any, Optional
 
@@ -203,26 +204,98 @@ def approval_voice_enabled(config: Optional[dict[str, Any]] = None) -> bool:
         return False
 
 
+_GENERIC_INTENT = "run a quick command on my box"
+
+# Fork patch P14.2: tokens that mark a "description" as runtime/shell jargon or
+# a raw command fragment, never a human intent. The upstream approval metadata
+# often carries a machine phrase like "script execution via -e/-c flag" (live
+# 2026-09 lilo-social/Stitch), and a passthrough of it read as robotic and
+# leaked implementation detail into a customer channel. Any hit ⇒ fall back to
+# the generic phrase rather than surface the description verbatim.
+_JARGON_DESC_MARKERS = (
+    "-e/-c",
+    "-c flag",
+    "-e flag",
+    "script execution",
+    "execute script",
+    "arbitrary code",
+    "code execution",
+    "os.environ",
+    "environ",
+    "printenv",
+    "subprocess",
+    "eval(",
+    "exec(",
+    "import ",
+    "$(",
+    "```",
+    "python3 -c",
+    "python -c",
+)
+
+
+# Interpreter inline-script execution (python/node/ruby/perl -c|-e, or the
+# bash|sh -c|-lc wrapper). Classified to a generic phrase so the ask never
+# echoes the flag jargon or the script body.
+_INLINE_SCRIPT_RE = re.compile(
+    r"(^|/)(python[0-9.]*|node|ruby|perl)\b[^\n]*\s-(?:c|e)\b"
+    r"|(^|/)(ba)?sh\b[^\n]*\s-[a-z]*c\b"
+)
+
+
+def _intent_desc_is_safe(desc: str, command: str) -> bool:
+    """True when a description reads as a human phrase, not jargon or a command.
+
+    Rejects a description that carries shell-flag jargon, code-shaped tokens, or
+    any run of the raw command — so the ask never surfaces implementation detail
+    (P14.2). Conservative: when in doubt, the caller uses the generic phrase.
+    """
+    d = (desc or "").strip()
+    if not d:
+        return False
+    low = d.lower()
+    if low in ("dangerous command", "command", "shell command"):
+        return False
+    for marker in _JARGON_DESC_MARKERS:
+        if marker in low:
+            return False
+    # A description that quotes (any 12+ char run of) the raw command is a leak.
+    cmd = (command or "").strip()
+    if cmd and len(cmd) >= 12 and cmd[:12].lower() in low:
+        return False
+    # Code punctuation density is a strong tell for a command masquerading as a
+    # description (braces, pipes, redirects, semicolons, backticks).
+    if any(ch in d for ch in "{}|;`") or "&&" in d:
+        return False
+    return True
+
+
 def summarize_command_intent(command: str, description: str = "") -> str:
     """Paraphrase a pending action into a short human phrase.
 
     The raw command is never surfaced; this classifies the command so the ask
     reads like a person ("read my instance details", "list some files on my
-    box", "call the AWS API"). Falls back to a redacted-free description or a
-    generic phrase. Used only to build the ask body, never to display the
-    command.
+    box", "call the AWS API"). Falls back to a description ONLY when it reads as
+    a human phrase (see :func:`_intent_desc_is_safe`), otherwise a generic
+    phrase. Used only to build the ask body, never to display the command.
     """
     cmd = (command or "").strip()
     low = cmd.lower()
     if not cmd:
         desc = (description or "").strip()
-        return desc or "run a quick command on my box"
+        return desc if _intent_desc_is_safe(desc, cmd) else _GENERIC_INTENT
     # Cloud instance metadata (the 2026-09-04 EC2-cost case).
     if "169.254.169.254" in low or "meta-data" in low or "instance-id" in low:
         return "read my instance details"
     # AWS API / cloud control-plane calls.
     if low.startswith("aws ") or "amazonaws.com" in low or " aws " in f" {low} ":
         return "call the AWS API"
+    # Inline-script / interpreter -c/-e execution (the 2026-09 python3 -c env
+    # dump). Classify to a plain phrase — never echo the "-e/-c flag" jargon or
+    # the script body into the ask. Covers python/node/ruby/perl -c|-e and the
+    # bash|sh -c|-lc wrapper.
+    if _INLINE_SCRIPT_RE.search(low):
+        return _GENERIC_INTENT
     # Directory listings.
     if low.startswith("ls ") or low == "ls" or low.startswith("find "):
         return "list some files on my box"
@@ -236,9 +309,9 @@ def summarize_command_intent(command: str, description: str = "") -> str:
     if low.startswith(("curl ", "wget ", "http ")):
         return "make a network request from my box"
     desc = (description or "").strip()
-    if desc and desc.lower() not in ("dangerous command",):
+    if _intent_desc_is_safe(desc, cmd):
         return desc
-    return "run a quick command on my box"
+    return _GENERIC_INTENT
 
 
 def approval_ask_text(requester_name: Optional[str], intent: str) -> str:

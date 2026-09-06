@@ -143,13 +143,20 @@ class TestFlagOnVoice:
         assert first["blocks"][1]["type"] == "actions"
 
     @pytest.mark.asyncio
-    async def test_raw_command_goes_to_a_details_thread_reply(self):
+    async def test_raw_command_never_in_channel_details_goes_to_requester_dm(self):
+        # P14.2: on an INTERNAL channel the ask + buttons post in-channel, but
+        # the raw command is NOT folded into a channel thread reply (every
+        # channel member could expand it — the 2026-09 lilo-social/Stitch
+        # leak). It goes to the requester's DM instead, or nowhere.
         adapter, client = _make_adapter()
         client.chat_postMessage = AsyncMock(
             side_effect=[{"ts": "1.1"}, {"ts": "1.2"}]
         )
         client.conversations_info = AsyncMock(
             return_value={"ok": True, "channel": {"is_ext_shared": False}}
+        )
+        client.conversations_open = AsyncMock(
+            return_value={"channel": {"id": "D999"}}
         )
         client.users_info = AsyncMock(
             return_value={"user": {"profile": {"display_name": "Jacob"}}}
@@ -164,10 +171,42 @@ class TestFlagOnVoice:
             )
 
         assert client.chat_postMessage.call_count == 2
+        ask = client.chat_postMessage.call_args_list[0].kwargs
         details = client.chat_postMessage.call_args_list[1].kwargs
-        assert details["thread_ts"] == "1.1"
+        # Ask + buttons went to the channel; details went to the requester DM.
+        assert ask["channel"] == "C1"
+        assert details["channel"] == "D999"
+        assert details.get("thread_ts") in (None, "1.2")  # DM root, not a C1 thread
+        assert details["channel"] != "C1"
         assert details["text"].startswith("details:")
         assert "meta-data" in details["text"]
+
+    @pytest.mark.asyncio
+    async def test_raw_command_withheld_when_no_private_target(self):
+        # P14.2: internal channel + unknown requester and no configured owner ⇒
+        # the command goes NOWHERE (never the channel). Only the ask posts.
+        adapter, client = _make_adapter()
+        client.chat_postMessage = AsyncMock(return_value={"ts": "1.1"})
+        client.conversations_info = AsyncMock(
+            return_value={"ok": True, "channel": {"is_ext_shared": False}}
+        )
+        client.conversations_open = AsyncMock(
+            return_value={"channel": {"id": "D999"}}
+        )
+
+        with patch(
+            "agent.hq_branding.approval_voice_enabled", return_value=True
+        ):
+            await adapter.send_exec_approval(
+                chat_id="C1", command=_META_CURL, session_key="s",
+                metadata=_md(),  # no user_id, no owner
+            )
+
+        # Exactly one send — the ask — and it went to the channel; no details.
+        assert client.chat_postMessage.call_count == 1
+        only = client.chat_postMessage.call_args_list[0].kwargs
+        assert only["channel"] == "C1"
+        assert "meta-data" not in only["blocks"][0]["text"]["text"]
 
     @pytest.mark.asyncio
     async def test_external_channel_routes_ask_to_requester_dm(self):
@@ -211,6 +250,9 @@ class TestFlagOnVoice:
         client.conversations_info = AsyncMock(
             return_value={"ok": True, "channel": {"is_ext_shared": True}}
         )
+        client.conversations_open = AsyncMock(
+            return_value={"channel": {"id": "D999"}}
+        )
         client.users_info = AsyncMock(
             return_value={"user": {"profile": {"display_name": "Jacob"}}}
         )
@@ -223,9 +265,17 @@ class TestFlagOnVoice:
                 metadata=_md(user_id="U123"),
             )
 
+        # The ASK is forced to the internal channel (not DM'd).
         assert client.chat_postMessage.call_args_list[0].kwargs["channel"] == "C1"
-        # conversations_open never needed — no DM routing.
-        client.conversations_open.assert_not_called()
+        # P14.2: the raw command still never posts to the channel — it goes to
+        # the requester DM. So no C1 message carries the command.
+        for call in client.chat_postMessage.call_args_list:
+            if call.kwargs.get("channel") == "C1":
+                blob = str(call.kwargs.get("text", "")) + str(
+                    call.kwargs.get("blocks", "")
+                )
+                assert "meta-data" not in blob
+                assert "169.254.169.254" not in blob
 
 
 # ===========================================================================

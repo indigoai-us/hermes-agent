@@ -251,9 +251,39 @@ def approval_ask_text(requester_name: Optional[str], intent: str) -> str:
 
 
 def approval_details_block(command: str) -> str:
-    """The raw (already-redacted) command, folded behind a details reply."""
+    """The raw (already-redacted) command, folded behind a details reply.
+
+    Only ever used where the platform has a real fold (a Slack threaded reply).
+    It is NEVER appended to a buttonless chat body — on a surface with no fold
+    the "details:" line and the raw command render inline in the message, which
+    is exactly the leak P14.1 removes (odin, 2026-09-06). The buttonless text
+    fallback uses :func:`approval_reply_hint` instead.
+    """
     cmd = (command or "").strip()
     return f"{APPROVAL_DETAILS_PREFIX}\n```\n{cmd}\n```"
+
+
+def approval_reply_hint(
+    allow_session: bool = True, allow_permanent: bool = True
+) -> str:
+    """Fork patch P14.1: a plain, scaffold-free reply hint for the buttonless
+    approval ask.
+
+    HQ fleet agents must never post the command-approval scaffold — the
+    ``/approve`` / ``/approve session`` / ``/approve always`` / ``/deny``
+    instruction block — or the raw command into a chat surface. On HQ DM that
+    scaffold leaked verbatim into a user DM (odin, 2026-09-06; policy
+    indigo-fleet-agents-never-broadcast-runtime-lifecycle-messages). The
+    approval GATE is unchanged: a plain "yes" / "no" reply resolves it through
+    the gateway's has_blocking_approval intercept, and HQ DM additionally
+    renders a clickable ``decision`` block (hqdm send_exec_approval, #40). This
+    hint carries NO slash command, NO raw command, and NO banner — only words a
+    person would use, each of which the intercept understands.
+    """
+    hint = "Reply *yes* to go ahead or *no* to skip."
+    if allow_session and allow_permanent:
+        hint += " Say *always* if you'd rather I stop asking for this."
+    return hint
 
 
 def approval_confirmation_text() -> str:
@@ -291,6 +321,7 @@ __all__ = [
     "approval_confirmation_text",
     "approval_denied_text",
     "approval_details_block",
+    "approval_reply_hint",
     "approval_voice_enabled",
     "summarize_command_intent",
     "back_online_notice",

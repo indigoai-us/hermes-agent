@@ -281,13 +281,47 @@ class TestGatewayTextFallback:
         assert "Dangerous command requires approval" in out
         assert "169.254.169.254" in out  # raw command in the stock body
 
-    def test_flag_on_is_human_with_folded_details(self):
+    def test_flag_on_is_human_with_no_scaffold_or_command(self):
+        # P14.1: the buttonless fallback is a plain human ask + a scaffold-free
+        # reply hint. No /approve|/deny scaffold, no raw command, no banner —
+        # the exact leak that reached a user DM on odin (2026-09-06).
         with patch("agent.hq_branding.approval_voice_enabled", return_value=True):
             out = _format_exec_approval_fallback(_META_CURL, "dangerous command", "/")
         head = out.split("\n", 1)[0]
         assert head == (
             "To answer that I need to read my instance details. OK to go ahead?"
         )
-        assert "169.254.169.254" not in head  # not in the body/ask line
-        assert "details:" in out  # folded below
+        # The whole message — not just the head — is free of the leak surfaces.
+        assert "169.254.169.254" not in out          # raw command never in body
+        assert "details:" not in out                  # no inline fold on a buttonless surface
+        assert "/approve" not in out                  # no approval scaffold
+        assert "/deny" not in out
+        assert "approve session" not in out
+        assert "approve always" not in out
         assert "Command Approval Required" not in out
+        assert "Dangerous command requires approval" not in out
+        assert "⚠" not in out
+        # It still tells a person how to answer, in plain words the gateway's
+        # has_blocking_approval intercept resolves.
+        assert "yes" in out.lower()
+        assert "no" in out.lower()
+
+    def test_flag_on_tripwire_no_scaffold_literals_across_variants(self):
+        forbidden = ("/approve", "/deny", "approve session", "approve always",
+                     "Command Approval Required", "⚠", "details:")
+        with patch("agent.hq_branding.approval_voice_enabled", return_value=True):
+            for allow_session in (True, False):
+                for allow_permanent in (True, False):
+                    for smart_denied in (True, False):
+                        out = _format_exec_approval_fallback(
+                            _META_CURL, "dangerous command", "/",
+                            allow_permanent=allow_permanent,
+                            allow_session=allow_session,
+                            smart_denied=smart_denied,
+                        )
+                        for bad in forbidden:
+                            assert bad not in out, (
+                                f"{bad!r} leaked with session={allow_session} "
+                                f"permanent={allow_permanent} smart_denied={smart_denied}"
+                            )
+                        assert "169.254.169.254" not in out

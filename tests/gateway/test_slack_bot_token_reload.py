@@ -214,7 +214,9 @@ async def test_new_source_token_mints_and_maps_client(tmp_path, monkeypatch):
     adapter._loaded_bot_token_raw = "xoxb-new1"
 
     minted = _FakeClient("xoxb-new2", team_id="T_SECOND", user_id="U2", user="bot2")
-    monkeypatch.setattr(_slack_mod, "AsyncWebClient", lambda **kw: minted)
+    # P11.1: clients are built through the adapter factory (store-bound), so
+    # patch the factory rather than the raw ``AsyncWebClient`` symbol.
+    monkeypatch.setattr(adapter, "_make_web_client", lambda **kw: minted)
     monkeypatch.setattr(_slack_mod, "_apply_slack_proxy", lambda *a, **k: None)
 
     changed = await adapter._reload_bot_token(reason="test")

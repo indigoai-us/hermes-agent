@@ -35,6 +35,131 @@ except ImportError:
     AsyncSocketModeHandler = Any
     AsyncWebClient = Any
 
+
+# ── Fork patch P11.1 (hq/v2): single-source bot-token provider ───────────────
+# The stock reload (P11) mutated the token *string* held by each Web client it
+# knew about (``app.client`` + ``_team_clients``). Any client built elsewhere —
+# the channel_directory sweep, thread-follow, file upload, users lookup — that
+# captured the startup token would keep using it after a rotation, so those
+# calls failed with ``token_expired`` until a full restart while the gateway
+# still reported Slack connected. P11.1 removes captured strings entirely: a
+# single ``_SlackBotTokenStore`` is the ONE source of truth, and every Web
+# client reads its token from the store at call time. A rotation is then a
+# single store update that every client observes atomically.
+class _SlackBotTokenStore:
+    """The live bot token(s), keyed by workspace, shared by every Web client.
+
+    ``primary`` backs the bolt app client and any workspace whose token is not
+    individually tracked; ``by_team`` holds the per-workspace outbound tokens.
+    ``generation`` bumps on every full rotation so tests/tripwires can assert a
+    swap actually propagated.
+    """
+
+    __slots__ = ("_primary", "_by_team", "generation")
+
+    def __init__(self, primary: Optional[str] = None) -> None:
+        self._primary = primary
+        self._by_team: Dict[str, str] = {}
+        self.generation = 0
+
+    def primary(self) -> Optional[str]:
+        return self._primary
+
+    def get(self, team_key: Optional[str]) -> Optional[str]:
+        if team_key and team_key in self._by_team:
+            return self._by_team[team_key]
+        return self._primary
+
+    def set_primary(self, token: Optional[str]) -> None:
+        self._primary = token
+
+    def set_team(self, team_key: Optional[str], token: Optional[str]) -> None:
+        if team_key and token is not None:
+            self._by_team[team_key] = token
+
+    def rotate(self, *, primary: Optional[str], by_team: Dict[str, str]) -> None:
+        """Atomically replace every tracked token in one shot."""
+        self._primary = primary
+        self._by_team = dict(by_team)
+        self.generation += 1
+
+
+if SLACK_AVAILABLE:
+
+    class _ReloadableAsyncWebClient(AsyncWebClient):  # type: ignore[misc,valid-type]
+        """An ``AsyncWebClient`` whose ``token`` is a live view of the store.
+
+        slack_sdk reads ``self.token`` afresh on every ``api_call`` (see
+        ``AsyncBaseClient.api_call``), so backing ``token`` with a property that
+        reads the shared store means a rotation needs no per-client mutation and
+        can never miss a holder: every client — present or future — that shares
+        the store sees the new token on its next call.
+        """
+
+        def __init__(
+            self,
+            *,
+            token_store: "_SlackBotTokenStore",
+            is_primary: bool = False,
+            initial_token: Optional[str] = None,
+            **kwargs: Any,
+        ) -> None:
+            # These must exist before super().__init__, which assigns
+            # ``self.token`` and would otherwise trip the setter with no state.
+            self._token_store = token_store
+            self._is_primary = is_primary
+            self._team_key: Optional[str] = None
+            self._pending_token: Optional[str] = None
+            super().__init__(token=initial_token, **kwargs)
+
+        @property
+        def token(self) -> Optional[str]:  # type: ignore[override]
+            if self._is_primary:
+                return self._token_store.primary()
+            if self._team_key is not None:
+                return self._token_store.get(self._team_key)
+            # Unbound workspace client mid-auth_test: use its own pending token
+            # (so it authenticates as the right workspace), else the primary.
+            if self._pending_token is not None:
+                return self._pending_token
+            return self._token_store.primary()
+
+        @token.setter
+        def token(self, value: Optional[str]) -> None:
+            v = value.strip() if isinstance(value, str) else value
+            # Never let a None assignment clobber the live token. slack_sdk's
+            # ``AsyncBaseClient.__init__`` does ``self.token = None`` when no
+            # token is passed (the store-bound primary client is built that
+            # way); a real token is always supplied via the store or a non-None
+            # assignment, so ignoring None keeps the single source intact.
+            if v is None:
+                return
+            if self._is_primary:
+                self._token_store.set_primary(v)
+            elif self._team_key is not None:
+                self._token_store.set_team(self._team_key, v)
+            else:
+                self._pending_token = v
+
+        def bind_team(self, team_id: str) -> None:
+            """Attach this client to a workspace, moving its pending token into
+            the shared store so future rotations for that workspace propagate."""
+            self._team_key = team_id
+            if self._pending_token is not None:
+                self._token_store.set_team(team_id, self._pending_token)
+                self._pending_token = None
+
+    # The real slack_sdk class the subclass was built from. Tests monkeypatch
+    # the module-level ``AsyncWebClient`` symbol to inject fakes into
+    # ``connect()``; ``_make_web_client`` honors that by only using the
+    # reloadable subclass when the symbol still points at the real class.
+    _REAL_ASYNC_WEB_CLIENT = AsyncWebClient
+
+else:  # pragma: no cover - slack_sdk not installed
+
+    _ReloadableAsyncWebClient = None  # type: ignore[assignment,misc]
+    _REAL_ASYNC_WEB_CLIENT = None  # type: ignore[assignment]
+
 import sys
 from pathlib import Path as _Path
 
@@ -1366,8 +1491,42 @@ class SlackAdapter(BasePlatformAdapter):
         # token file, sampled each watchdog tick.
         self._bot_token_reload_baseline: Optional[Tuple[Any, ...]] = None
         # Set by the Web API error classifier when it sees invalid_auth /
-        # token_revoked; the watchdog picks it up and reloads within a tick.
+        # token_revoked / token_expired; the watchdog picks it up and reloads
+        # within a tick.
         self._pending_auth_reload = False
+        # Fork patch P11.1: the single source of truth for the live bot
+        # token(s). Every reloadable Web client reads its token from here, so a
+        # rotation is one store update, not a per-client string swap. Populated
+        # at connect(); a placeholder here keeps object.__new__ test harnesses
+        # and pre-connect attribute access safe.
+        self._token_store = _SlackBotTokenStore()
+        # Last Slack auth health we reported to gateway runtime status, so the
+        # degraded/connected transition is written once (no flap/log spam).
+        self._slack_auth_degraded = False
+
+    def _make_web_client(
+        self, *, is_primary: bool = False, initial_token: Optional[str] = None
+    ) -> Any:
+        """Build a Web client bound to the shared token store (P11.1).
+
+        Falls back to a plain ``AsyncWebClient`` only when the reloadable
+        subclass is unavailable (slack_sdk not installed) — in which case the
+        adapter cannot connect anyway.
+        """
+        # Honor a test-monkeypatched ``AsyncWebClient`` symbol (and the
+        # no-slack_sdk fallback): only the real class gets the store-bound
+        # reloadable subclass.
+        if _ReloadableAsyncWebClient is None or AsyncWebClient is not _REAL_ASYNC_WEB_CLIENT:
+            return AsyncWebClient(
+                token=initial_token,
+                user_agent_prefix=_HERMES_SLACK_USER_AGENT_PREFIX,
+            )
+        return _ReloadableAsyncWebClient(
+            token_store=self._token_store,
+            is_primary=is_primary,
+            initial_token=initial_token,
+            user_agent_prefix=_HERMES_SLACK_USER_AGENT_PREFIX,
+        )
 
     async def _close_workspace_clients(self) -> None:
         """Close any Slack SDK clients that may own aiohttp sessions."""
@@ -1496,8 +1655,17 @@ class SlackAdapter(BasePlatformAdapter):
                 if t.strip()
             ]
 
-            # Update the bolt app client (inbound event context) to the new
-            # primary token in place.
+            # P11.1: update the single source of truth first. Every reloadable
+            # Web client (app.client, per-workspace clients, and any helper
+            # client built from the same factory — channel_directory, thread
+            # follow, file upload, users lookup) reads its token from the store
+            # at call time, so this one write refreshes them all atomically.
+            store = getattr(self, "_token_store", None)
+            if store is not None:
+                store.set_primary(fresh_tokens[0])
+            # Also assign the app client's token explicitly. For a reloadable
+            # client this routes back into the store (idempotent); for the
+            # MagicMock/fake app used in tests it swaps the plain attribute.
             try:
                 self._app.client.token = fresh_tokens[0]
             except Exception:
@@ -1514,19 +1682,23 @@ class SlackAdapter(BasePlatformAdapter):
                     continue  # this workspace's token did not change
                 updated_in_place = False
                 if old_tok is not None:
-                    for client in self._team_clients.values():
+                    for team_id_existing, client in self._team_clients.items():
                         if getattr(client, "token", None) == old_tok:
-                            client.token = new_tok  # same workspace, pure swap
+                            # Same workspace: pure swap. On a reloadable client
+                            # this writes through to the store slot; on a fake it
+                            # sets the attribute. Update the store slot directly
+                            # too so the source of truth is authoritative even
+                            # for non-reloadable clients.
+                            client.token = new_tok
+                            if store is not None:
+                                store.set_team(team_id_existing, new_tok)
                             updated_in_place = True
                             break
                 if updated_in_place:
                     continue
                 # A brand-new source token with no existing client: mint one and
                 # identify its workspace so outbound sends route correctly.
-                client = AsyncWebClient(
-                    token=new_tok,
-                    user_agent_prefix=_HERMES_SLACK_USER_AGENT_PREFIX,
-                )
+                client = self._make_web_client(initial_token=new_tok)
                 _apply_slack_proxy(client, self._proxy_url)
                 try:
                     auth = await client.auth_test()
@@ -1539,6 +1711,11 @@ class SlackAdapter(BasePlatformAdapter):
                     await self._safe_close_client(client)
                     return False
                 team_id = auth.get("team_id", "")
+                bind = getattr(client, "bind_team", None)
+                if callable(bind):
+                    bind(team_id)
+                elif store is not None:
+                    store.set_team(team_id, new_tok)
                 self._team_clients[team_id] = client
                 self._team_bot_user_ids[team_id] = auth.get("user_id", "")
                 self._team_bot_names[team_id] = auth.get("user", "unknown")
@@ -1546,6 +1723,8 @@ class SlackAdapter(BasePlatformAdapter):
             self.config.token = fresh_raw
             self._loaded_bot_token_raw = fresh_raw
             self._pending_auth_reload = False
+            # Rotation applied cleanly ⇒ any prior token_expired degrade clears.
+            self._note_slack_auth_health(degraded=False)
             logger.info(
                 "[Slack] Bot token reloaded in place (%s); Socket Mode "
                 "connection preserved, no restart",
@@ -1575,6 +1754,50 @@ class SlackAdapter(BasePlatformAdapter):
                 "[Slack] token reload attempt failed; will retry on next signal",
                 exc_info=True,
             )
+
+    def _note_slack_auth_health(
+        self, *, degraded: bool, error_code: Optional[str] = None
+    ) -> None:
+        """Report a Slack Web-API auth health transition to gateway runtime
+        status (P11.1).
+
+        Writes ``platform_state="degraded"`` with the raw Slack error code (e.g.
+        ``token_expired``) the first time an auth failure is observed, and
+        ``platform_state="connected"`` once a reload restores auth — so the
+        monitor never sees a stale "connected" while every call 401s. Written
+        only on transition to avoid flap/log spam, and defensively guarded so a
+        status-write failure never breaks the calling path.
+        """
+        try:
+            already = getattr(self, "_slack_auth_degraded", False)
+            if degraded == already:
+                return
+            self._slack_auth_degraded = degraded
+            writer = getattr(self, "_write_runtime_status_safe", None)
+            if not callable(writer):
+                return
+            if degraded:
+                writer(
+                    "auth_degraded",
+                    platform_state="degraded",
+                    error_code=error_code or "token_expired",
+                    error_message=(
+                        "Slack Web API auth failing "
+                        f"({error_code or 'token_expired'}); "
+                        "awaiting bot-token reload"
+                    ),
+                    needs_attention=True,
+                )
+            else:
+                writer(
+                    "auth_recovered",
+                    platform_state="connected",
+                    error_code=None,
+                    error_message=None,
+                    needs_attention=False,
+                )
+        except Exception:  # pragma: no cover - defensive; never break callers
+            logger.debug("[Slack] auth-health status write failed", exc_info=True)
 
     @staticmethod
     def _slack_timestamp_sort_key(ts: Any) -> Tuple[int, int, str]:
@@ -2034,12 +2257,28 @@ class SlackAdapter(BasePlatformAdapter):
                 else "Missing required Slack scope."
             )
             return f"Slack attachment access failed for {file_label}. {needed_hint}{provided_hint}{reinstall_hint}"
-        if error in {"not_authed", "invalid_auth", "account_inactive", "token_revoked"}:
+        if error in {
+            "not_authed",
+            "invalid_auth",
+            "account_inactive",
+            "token_revoked",
+            "token_expired",
+        }:
             # Fork patch P11: an auth failure on a live Web call is the reactive
             # trigger for a restart-free reload. Flag it (cheap, sync); the
             # watchdog applies the swap within a tick. No-op unless enabled.
-            if error in {"invalid_auth", "token_revoked"} and self._bot_token_reload_enabled():
+            # ``token_expired`` is the error hq-pro's rotation produces, so it
+            # MUST arm the reload — omitting it (the pre-P11.1 bug) left every
+            # Web call failing until a full restart.
+            if (
+                error in {"invalid_auth", "token_revoked", "token_expired"}
+                and self._bot_token_reload_enabled()
+            ):
                 self._pending_auth_reload = True
+            # P11.1: surface the auth failure to gateway runtime status so the
+            # monitor sees ``slack: degraded (token_expired)`` instead of a
+            # stale "connected" while every call 401s.
+            self._note_slack_auth_health(degraded=True, error_code=error)
             return f"Slack attachment access failed for {file_label} because the bot token is not authorized ({error}). Refresh the token/reinstall the app."
         if error in {"file_not_found", "file_deleted"}:
             return f"Slack attachment {file_label} is no longer available ({error})."
@@ -2523,11 +2762,14 @@ class SlackAdapter(BasePlatformAdapter):
             self._bot_token_reload_baseline = self._bot_token_reload_signature()
             self._pending_auth_reload = False
 
-            # First token is the primary — used for AsyncApp / Socket Mode
+            # First token is the primary — used for AsyncApp / Socket Mode.
+            # P11.1: the store is the single source of truth; every Web client
+            # is built via ``_make_web_client`` so it reads its token live.
             primary_token = bot_tokens[0]
-            primary_client = AsyncWebClient(
-                token=primary_token,
-                user_agent_prefix=_HERMES_SLACK_USER_AGENT_PREFIX,
+            self._token_store = _SlackBotTokenStore(primary=primary_token)
+            self._slack_auth_degraded = False
+            primary_client = self._make_web_client(
+                is_primary=True, initial_token=primary_token
             )
             self._app = AsyncApp(
                 token=primary_token,
@@ -2538,16 +2780,19 @@ class SlackAdapter(BasePlatformAdapter):
 
             # Register each bot token and map team_id → client
             for token in bot_tokens:
-                client = AsyncWebClient(
-                    token=token,
-                    user_agent_prefix=_HERMES_SLACK_USER_AGENT_PREFIX,
-                )
+                client = self._make_web_client(initial_token=token)
                 _apply_slack_proxy(client, proxy_url)
                 auth_response = await client.auth_test()
                 team_id = auth_response.get("team_id", "")
                 bot_user_id = auth_response.get("user_id", "")
                 bot_name = auth_response.get("user", "unknown")
                 team_name = auth_response.get("team", "unknown")
+
+                # Bind the client to its workspace so its token now tracks the
+                # store's per-team slot (moves the pending token into the store).
+                bind = getattr(client, "bind_team", None)
+                if callable(bind):
+                    bind(team_id)
 
                 self._team_clients[team_id] = client
                 self._team_bot_user_ids[team_id] = bot_user_id

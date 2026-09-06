@@ -46,6 +46,35 @@ except ImportError:
 # single ``_SlackBotTokenStore`` is the ONE source of truth, and every Web
 # client reads its token from the store at call time. A rotation is then a
 # single store update that every client observes atomically.
+# Fork patch P11.2 (hq/v2): the auth-error codes that mean "the bot token is no
+# longer valid — reload it." Seen on ANY Slack Web API path (bolt authorize,
+# channel_directory, posting, attachments) they all arm the restart-free reload.
+_SLACK_AUTH_ERROR_CODES = frozenset(
+    {"invalid_auth", "token_revoked", "token_expired", "not_authed", "account_inactive"}
+)
+# The subset that additionally arms the *reactive* reload (a stale/expired token
+# that a fresh on-disk token would fix). ``not_authed`` / ``account_inactive``
+# are surfaced/degraded but not treated as "reload will fix it".
+_SLACK_RELOAD_ARMING_CODES = frozenset({"invalid_auth", "token_revoked", "token_expired"})
+
+
+def _slack_error_code(obj: Any) -> str:
+    """Extract a Slack error code from a SlackApiError, its ``.response``, or a
+    response-like mapping. Returns "" when none is present. Never raises."""
+    try:
+        resp = getattr(obj, "response", obj)
+        if resp is None:
+            return ""
+        if hasattr(resp, "get"):
+            return str(resp.get("error", "") or "").strip()
+        data = getattr(resp, "data", None)
+        if hasattr(data, "get"):
+            return str(data.get("error", "") or "").strip()
+    except Exception:  # pragma: no cover - defensive
+        return ""
+    return ""
+
+
 class _SlackBotTokenStore:
     """The live bot token(s), keyed by workspace, shared by every Web client.
 
@@ -55,12 +84,19 @@ class _SlackBotTokenStore:
     swap actually propagated.
     """
 
-    __slots__ = ("_primary", "_by_team", "generation")
+    __slots__ = ("_primary", "_by_team", "generation", "pending_auth_reload", "on_auth_error")
 
     def __init__(self, primary: Optional[str] = None) -> None:
         self._primary = primary
         self._by_team: Dict[str, str] = {}
         self.generation = 0
+        # Fork patch P11.2: reactive reload state, centralized here so ANY
+        # Web client (or the bolt authorize path) that sees an auth error can
+        # arm the reload through the single source of truth.
+        self.pending_auth_reload = False
+        # Optional callback(code:str) the adapter registers to mirror the arm
+        # onto its watchdog flag + gateway degraded status.
+        self.on_auth_error: Optional[Any] = None
 
     def primary(self) -> Optional[str]:
         return self._primary
@@ -82,6 +118,22 @@ class _SlackBotTokenStore:
         self._primary = primary
         self._by_team = dict(by_team)
         self.generation += 1
+
+    def note_auth_error(self, code: str) -> None:
+        """Record a Web-API auth failure seen anywhere and fan it out (P11.2).
+
+        Any ``invalid_auth`` / ``token_revoked`` / ``token_expired`` observed on
+        any client or the bolt authorize path arms the reactive reload through
+        this single method, and notifies the adapter callback (watchdog flag +
+        degraded status). Never raises."""
+        try:
+            if code in _SLACK_RELOAD_ARMING_CODES:
+                self.pending_auth_reload = True
+            cb = self.on_auth_error
+            if cb is not None:
+                cb(code)
+        except Exception:  # pragma: no cover - defensive; never break a caller
+            pass
 
 
 if SLACK_AVAILABLE:
@@ -148,6 +200,29 @@ if SLACK_AVAILABLE:
             if self._pending_token is not None:
                 self._token_store.set_team(team_id, self._pending_token)
                 self._pending_token = None
+
+        async def api_call(self, *args: Any, **kwargs: Any):  # type: ignore[override]
+            """Fork patch P11.2: centralize reactive arming. slack_sdk raises
+            ``SlackApiError`` on ``ok:false``, so every auth failure on every
+            Web-API path this client serves (channel_directory sweep, users
+            lookup, posting/replies, files) funnels through here and arms the
+            reload via the shared store. Also inspects an ``ok:false`` result on
+            the rare path where a caller disabled response validation."""
+            try:
+                resp = await super().api_call(*args, **kwargs)
+            except Exception as exc:  # SlackApiError and subclasses carry .response
+                code = _slack_error_code(exc)
+                if code in _SLACK_AUTH_ERROR_CODES:
+                    self._token_store.note_auth_error(code)
+                raise
+            try:
+                if getattr(resp, "get", None) and resp.get("ok") is False:
+                    code = str(resp.get("error", "") or "").strip()
+                    if code in _SLACK_AUTH_ERROR_CODES:
+                        self._token_store.note_auth_error(code)
+            except Exception:  # pragma: no cover - defensive
+                pass
+            return resp
 
     # The real slack_sdk class the subclass was built from. Tests monkeypatch
     # the module-level ``AsyncWebClient`` symbol to inject fakes into
@@ -1500,6 +1575,12 @@ class SlackAdapter(BasePlatformAdapter):
         # at connect(); a placeholder here keeps object.__new__ test harnesses
         # and pre-connect attribute access safe.
         self._token_store = _SlackBotTokenStore()
+        # Fork patch P11.2: any auth error seen anywhere fans out through the
+        # store to this callback (arm reactive reload + degraded status).
+        self._token_store.on_auth_error = self._handle_store_auth_error
+        # Cache of {token_value: auth_test_response} for the store-backed bolt
+        # authorize callable, so per-turn authorize does not re-hit auth.test.
+        self._authorize_cache: Dict[str, Any] = {}
         # Last Slack auth health we reported to gateway runtime status, so the
         # degraded/connected transition is written once (no flap/log spam).
         self._slack_auth_degraded = False
@@ -1723,6 +1804,20 @@ class SlackAdapter(BasePlatformAdapter):
             self.config.token = fresh_raw
             self._loaded_bot_token_raw = fresh_raw
             self._pending_auth_reload = False
+            # Fork patch P11.2: clear the central reactive flag and drop the bolt
+            # authorize auth_test cache so the next request re-auths with the new
+            # token. Also refresh bolt's captured app token defensively (it is
+            # None on the authorize path, but harmless to set).
+            try:
+                self._token_store.pending_auth_reload = False
+            except Exception:  # pragma: no cover - defensive
+                pass
+            self._authorize_cache = {}
+            try:
+                if self._app is not None and getattr(self._app, "_token", None):
+                    self._app._token = fresh_tokens[0]
+            except Exception:  # pragma: no cover - defensive
+                pass
             # Rotation applied cleanly ⇒ any prior token_expired degrade clears.
             self._note_slack_auth_health(degraded=False)
             logger.info(
@@ -1740,7 +1835,8 @@ class SlackAdapter(BasePlatformAdapter):
             return
         signature = self._bot_token_reload_signature()
         changed = signature != self._bot_token_reload_baseline
-        if not (changed or self._pending_auth_reload):
+        store_pending = bool(getattr(self._token_store, "pending_auth_reload", False))
+        if not (changed or self._pending_auth_reload or store_pending):
             return
         # Advance the baseline BEFORE the reload so a reload failure does not
         # spin every tick; the reactive flag / next sentinel touch re-arms it.
@@ -1754,6 +1850,33 @@ class SlackAdapter(BasePlatformAdapter):
                 "[Slack] token reload attempt failed; will retry on next signal",
                 exc_info=True,
             )
+
+    def _schedule_post_connect_token_reread(self, delay_s: float = 5.0) -> None:
+        """Fork patch P11.2: close the startup race. The gateway reads
+        SLACK_BOT_TOKEN from the env at process start, which can precede the
+        refresher's first post-boot write by a second or two — so the process
+        can sit on an expired seeded token with NO rotation to trip the sentinel
+        (dbooth 2026-09-06: gateway 08:30:32Z, token file 08:30:34Z). Once,
+        shortly after connect, re-read the token file and reload if it changed.
+        No-op unless reload is enabled."""
+        if not self._bot_token_reload_enabled():
+            return
+
+        async def _reread() -> None:
+            try:
+                await asyncio.sleep(delay_s)
+                await self._reload_bot_token(reason="post_connect_reread")
+            except asyncio.CancelledError:  # pragma: no cover
+                raise
+            except Exception:  # pragma: no cover - defensive
+                logger.debug(
+                    "[Slack] post-connect token re-read failed", exc_info=True
+                )
+
+        try:
+            asyncio.create_task(_reread())
+        except RuntimeError:  # pragma: no cover - no running loop (unit tests)
+            pass
 
     def _note_slack_auth_health(
         self, *, degraded: bool, error_code: Optional[str] = None
@@ -1798,6 +1921,69 @@ class SlackAdapter(BasePlatformAdapter):
                 )
         except Exception:  # pragma: no cover - defensive; never break callers
             logger.debug("[Slack] auth-health status write failed", exc_info=True)
+
+    def _handle_store_auth_error(self, code: str) -> None:
+        """Fork patch P11.2: single fan-out for a Web-API auth failure seen on
+        ANY path (bolt authorize, channel_directory, posting, attachments).
+
+        Arms the reactive watchdog reload (only when reload is enabled, so a
+        flag-off install stays byte-for-byte stock) and reports the degraded
+        gateway status (always — pure observability). Never raises."""
+        try:
+            if code in _SLACK_RELOAD_ARMING_CODES and self._bot_token_reload_enabled():
+                self._pending_auth_reload = True
+            self._note_slack_auth_health(degraded=True, error_code=code or "token_expired")
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("[Slack] auth-error fan-out failed", exc_info=True)
+
+    def _make_store_authorize(self):
+        """Return a bolt ``authorize`` callable backed by the token store (P11.2).
+
+        Stock ``AsyncSingleTeamAuthorization`` authenticates the per-request
+        client that async_app builds from the *captured* app token, so a
+        reloaded token never reaches the bolt auth path. This callable instead
+        reads the LIVE token from the store, caches the ``auth.test`` response by
+        token value (so a steady token costs no per-turn round-trip), rebuilds it
+        when the token rotates, and arms the reload on an auth error.
+        """
+        try:
+            from slack_bolt.authorization import AuthorizeResult
+        except Exception:  # pragma: no cover - slack_bolt missing; authorize unused
+            AuthorizeResult = None  # type: ignore[assignment]
+
+        async def _authorize(context, enterprise_id=None, team_id=None,
+                             user_id=None, **kwargs):
+            store = self._token_store
+            token = store.get(team_id) if team_id else store.primary()
+            if not token:
+                token = store.primary()
+            if not token or AuthorizeResult is None:
+                return None
+            cache = getattr(self, "_authorize_cache", None)
+            if cache is None:
+                cache = self._authorize_cache = {}
+            auth = cache.get(token)
+            if auth is None:
+                client = getattr(context, "client", None) or self._app.client
+                try:
+                    auth = await client.auth_test(token=token)
+                except Exception as exc:
+                    code = _slack_error_code(exc)
+                    if code in _SLACK_AUTH_ERROR_CODES:
+                        store.note_auth_error(code)
+                    else:
+                        logger.debug("[Slack] authorize auth_test failed (%s)",
+                                     type(exc).__name__)
+                    return None
+                # Only the current token is worth caching; a rotation changes the
+                # key and re-auths once.
+                cache.clear()
+                cache[token] = auth
+            return AuthorizeResult.from_auth_test_response(
+                auth_test_response=auth, bot_token=token
+            )
+
+        return _authorize
 
     @staticmethod
     def _slack_timestamp_sort_key(ts: Any) -> Tuple[int, int, str]:
@@ -2257,28 +2443,14 @@ class SlackAdapter(BasePlatformAdapter):
                 else "Missing required Slack scope."
             )
             return f"Slack attachment access failed for {file_label}. {needed_hint}{provided_hint}{reinstall_hint}"
-        if error in {
-            "not_authed",
-            "invalid_auth",
-            "account_inactive",
-            "token_revoked",
-            "token_expired",
-        }:
-            # Fork patch P11: an auth failure on a live Web call is the reactive
-            # trigger for a restart-free reload. Flag it (cheap, sync); the
-            # watchdog applies the swap within a tick. No-op unless enabled.
-            # ``token_expired`` is the error hq-pro's rotation produces, so it
-            # MUST arm the reload — omitting it (the pre-P11.1 bug) left every
-            # Web call failing until a full restart.
-            if (
-                error in {"invalid_auth", "token_revoked", "token_expired"}
-                and self._bot_token_reload_enabled()
-            ):
-                self._pending_auth_reload = True
-            # P11.1: surface the auth failure to gateway runtime status so the
-            # monitor sees ``slack: degraded (token_expired)`` instead of a
-            # stale "connected" while every call 401s.
-            self._note_slack_auth_health(degraded=True, error_code=error)
+        if error in _SLACK_AUTH_ERROR_CODES:
+            # Fork patch P11/P11.2: an auth failure on a live Web call is the
+            # reactive trigger for a restart-free reload. Route it through the
+            # store's central fan-out so this site behaves identically to every
+            # other auth-error path (arm reactive reload when enabled + report
+            # degraded gateway status). ``token_expired`` is the error hq-pro's
+            # rotation produces.
+            self._token_store.note_auth_error(error)
             return f"Slack attachment access failed for {file_label} because the bot token is not authorized ({error}). Refresh the token/reinstall the app."
         if error in {"file_not_found", "file_deleted"}:
             return f"Slack attachment {file_label} is no longer available ({error})."
@@ -2767,13 +2939,24 @@ class SlackAdapter(BasePlatformAdapter):
             # is built via ``_make_web_client`` so it reads its token live.
             primary_token = bot_tokens[0]
             self._token_store = _SlackBotTokenStore(primary=primary_token)
+            self._token_store.on_auth_error = self._handle_store_auth_error
+            self._authorize_cache = {}
             self._slack_auth_degraded = False
             primary_client = self._make_web_client(
                 is_primary=True, initial_token=primary_token
             )
+            # Fork patch P11.2: authorize through the token store. async_app
+            # builds a FRESH AsyncWebClient with the *captured* token on every
+            # request (see async_app._build_req + _init_context), so the stock
+            # single-team authorize never sees a reloaded token and the bolt
+            # auth path stayed expired until a full restart. Passing
+            # ``authorize=`` makes bolt drop the static token and use our
+            # store-backed callable, which reads the live token and arms the
+            # reload on an auth error.
             self._app = AsyncApp(
                 token=primary_token,
                 client=primary_client,
+                authorize=self._make_store_authorize(),
                 before_authorize=_slack_per_request_proxy_middleware(proxy_url),
             )
             _apply_slack_proxy(self._app.client, proxy_url)
@@ -3050,6 +3233,9 @@ class SlackAdapter(BasePlatformAdapter):
                 self._start_socket_mode_handler()
                 self._running = True
                 self._ensure_socket_watchdog()
+                # Fork patch P11.2: close the startup race (seeded env token can
+                # predate the refresher's first write). One-shot re-read at T+5s.
+                self._schedule_post_connect_token_reread()
             except Exception:
                 self._running = False
                 try:

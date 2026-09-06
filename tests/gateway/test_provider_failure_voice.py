@@ -163,6 +163,51 @@ def test_structured_log_emitted_even_when_suppressed(voice_enabled, caplog):
     assert "class=billing" in joined
 
 
+# ── P17.1: never rewrite a SUCCESSFUL turn ───────────────────────────────────
+
+def test_successful_turn_is_never_recomposed_even_if_error_shaped(voice_enabled):
+    # A successful reply (finish_reason=stop) that merely looks error-shaped —
+    # e.g. begins with a status code — must be returned VERBATIM when the caller
+    # signals the turn did not fail. This is the core P17.1 guard.
+    answer = "835 files."
+    out = _sanitize_gateway_final_response(
+        CHAT, answer, "hqdm:cA:tA", False  # turn_had_provider_error=False
+    )
+    assert out == answer
+
+
+def test_short_numeric_answer_survives_even_when_gate_defaults_on(voice_enabled):
+    # Belt-and-suspenders: even if a caller cannot signal outcome (defaults to
+    # True), the classifier fix alone keeps a short numeric answer untouched.
+    answer = "829 files."
+    out = _sanitize_gateway_final_response(CHAT, answer, "hqdm:cA:tA")
+    assert out == answer
+
+
+def test_provider_error_turn_is_still_recomposed_when_flagged(voice_enabled):
+    # The incident case: a real billing failure (turn_had_provider_error=True)
+    # is still recomposed into the in-voice line.
+    out = _sanitize_gateway_final_response(
+        CHAT, GROK_BILLING_FINAL, "hqdm:cA:tA", True
+    )
+    assert "credits are out" in out
+    _assert_clean(out)
+
+
+def test_result_signals_provider_error_helper():
+    from gateway.run import _result_signals_provider_error as sig
+    assert sig({"failed": True}) is True
+    assert sig({"error": "boom"}) is True
+    assert sig({"failure_reason": "billing"}) is True
+    assert sig({"billing_block": {"provider": "grok"}}) is True
+    # A clean successful turn — nothing set.
+    assert sig({"final_response": "835 files.", "failed": False,
+                "error": None, "failure_reason": None}) is False
+    assert sig({}) is False
+    # Odd shapes fail safe to True (never silently pass a real failure).
+    assert sig(None) is True
+
+
 # ── Raw-text surfaces keep diagnostics ───────────────────────────────────────
 
 def test_local_surface_keeps_raw(voice_enabled):
